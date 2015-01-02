@@ -1,0 +1,12 @@
+.venv
+build
+dist
+htmlcov
+node_modules
+.pytest_cache
+.ruff_cache
+.git
+docs/_build
+subprojects
+
+<!-- maintenance 2015 -->
