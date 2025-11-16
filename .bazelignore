@@ -8,5 +8,3 @@ node_modules
 .git
 docs/_build
 subprojects
-
-<!-- maintenance 2025 -->
