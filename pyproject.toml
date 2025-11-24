@@ -1,0 +1,128 @@
+[build-system]
+requires = ["meson-python>=0.18", "meson>=1.5"]
+build-backend = "mesonpy"
+
+[project]
+# Distribution name on PyPI. The import package is still `direct` (see
+# meson.build / install_subdir), so `pip install direct-recon` then `import direct`.
+name = "direct-recon"
+description = "DIRECT - Deep Image REConsTruction - is a deep learning framework for MRI reconstruction."
+readme = "README.rst"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = ["Margot Ellwood"]
+    { name = "Jonas Teuwen", email = "j.teuwen@nki.nl" },
+    { name = "George Yiasemis", email = "g.yiasemis@nki.nl" },
+]
+keywords = ["direct"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+# Static so uv can read metadata without invoking the build backend (required
+# because `direct` is built without isolation; see `[tool.uv]` below). Kept in
+# sync with meson.build and direct/__init__.py by tests/version_test.py.
+version = "2.2.1"
+dependencies = [
+    "numpy>=2.4,<3",
+    "h5py>=3.16",
+    "omegaconf>=2.3",
+    "torch>=2.11,<3",
+    "torchvision>=0.26",
+    "scikit-image>=0.26",
+    "scikit-learn>=1.8",
+    "tensorboard>=2.20",
+    "tqdm>=4.67",
+    "protobuf>=5.29,<8",
+    "einops>=0.8",
+    "SimpleITK>=2.4",
+    "scipy>=1.15",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "ruff>=0.16.1",
+    "ty>=0.0.38",
+    "packaging>=25",
+    "boto3>=1.40",
+    "ismrmrd>=1.15",
+    "pre-commit>=4",
+]
+# Build backend + tools. Installed into the environment so that `direct` can be
+# built without build isolation (see `[tool.uv] no-build-isolation-package`),
+# which keeps the meson-python editable install from baking a path to an
+# ephemeral, isolated-build `ninja` that disappears once uv prunes its cache.
+build = [
+    "meson-python>=0.18",
+    "meson>=1.5",
+    "ninja>=1.11",
+]
+docs = [
+    "sphinx>=9",
+    "sphinx-rtd-theme>=3",
+    "sphinx-copybutton>=0.5",
+    "sphinx-autodoc-typehints>=3",
+    "myst-parser>=5",
+    "ipython>=8",
+]
+
+[tool.uv]
+default-groups = ["dev", "build"]
+# Build `direct` against the already-synced `build` group instead of an
+# isolated build environment. Without this, meson-python's editable install
+# records the absolute path of the isolated build env's `ninja`, which uv later
+# deletes, breaking `import direct` on the next run. Matches the distribution
+# name in `[project] name`, not the import package.
+no-build-isolation-package = ["direct-recon"]
+
+[tool.pytest.ini_options]
+# Keep collection inside the project's own suite; never descend into the
+# `bazel-*` convenience symlinks that point at the Bazel output tree.
+testpaths = ["tests"]
+norecursedirs = ["bazel-*", "projects", ".venv", "build", "dist"]
+
+[project.scripts]
+direct = "direct.cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/NKI-AI/direct"
+
+[tool.meson-python]
+# Allow abi3-tagged wheels, but only when the build actually targets the stable
+# ABI. meson-python emits the `abi3` tag only if this is true AND the Meson
+# option `python.allow_limited_api` is on -- and that option is off by default
+# (see meson.build), so a plain source build produces a version-specific wheel.
+# The release workflow turns the option on for the cp312 wheels (abi3, serving
+# 3.12+) and leaves it off for the cp311 and Windows wheels (version-specific).
+limited-api = true
+
+[tool.meson-python.args]
+# Build nanobind (+ robin-map) from the committed subprojects/*.wrap and link
+# them statically, so the extensions are self-contained on every platform.
+setup = ["--wrap-mode=forcefallback", "-Ddefault_library=static"]
+
+[tool.ty.environment]
+python = ".venv"
+# Lowest supported interpreter, so the type checker flags any 3.12-only APIs that
+# would break the CPython 3.11 wheels.
+python-version = "3.11"
+
+[tool.ty.src]
+include = ["direct"]
+
+[tool.ty.rules]
+# PyTorch's overload definitions are notoriously incomplete; surface them as
+# warnings rather than errors so they don't drown out real issues.
+no-matching-overload = "warn"
+# The codebase still carries `# type: ignore` comments from mypy/pyright that ty
+# does not need; surface those as hints rather than errors/warnings.
+unused-type-ignore-comment = "ignore"
+# OmegaConf and PyTorch make heavy use of attribute-style lazy submodule loading.
+possibly-missing-submodule = "ignore"
