@@ -1,0 +1,24 @@
+line-length = 120
+target-version = "py311"
+
+[lint]
+extend-select = ["I"]
+# The codebase intentionally raises `ValueError`/`AssertionError` for invalid
+# input; enforcing `TypeError` here would change the public exception contract.
+ignore = ["TRY004"]
+
+[lint.per-file-ignores]
+# Re-exports via star imports + __all__ are an intentional package pattern.
+"**/__init__.py" = ["F401", "F403", "F405"]
+# Tests pull in everything from the module under test for convenience.
+"tests/**/*.py" = ["F401", "F403", "F405", "F841"]
+# Research / example scripts deliberately use star imports to mirror notebook
+# ergonomics; they are not part of the library API surface.
+"projects/**/*.py" = ["F401", "F403", "F405"]
+# Sphinx conf.py interleaves config and conditional imports by convention.
+"docs/conf.py" = ["E402"]
+# `get_config` is injected into the namespace by Jupyter at runtime.
+"docker/jupyter_notebook_config.py" = ["F821"]
+
+[format]
+docstring-code-format = true
