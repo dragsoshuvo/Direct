@@ -1,0 +1,169 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""direct.nn.rim.rim_engine module."""
+
+from collections.abc import Callable
+
+import torch
+from torch import nn
+from torch.amp import autocast
+
+import direct.data.transforms as T
+from direct.config import BaseConfig
+from direct.engine import DoIterationOutput
+from direct.nn.mri_models import MRIModelEngine
+from direct.types import FFTOperator
+from direct.utils import detach_dict, dict_to_device, reduce_list_of_dicts
+
+
+class RIMEngine(MRIModelEngine):
+    """Recurrent Inference Machine Engine."""
+
+    def __init__(
+        self,
+        cfg: BaseConfig,
+        model: nn.Module,
+        device: str,
+        forward_operator: FFTOperator,
+        backward_operator: FFTOperator,
+        mixed_precision: bool = False,
+        **models: nn.Module,
+    ):
+        """Inits :class:`RIMEngine`.
+
+        Args:
+            cfg: Configuration file.
+            model: Model.
+            device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+            forward_operator: The forward operator. Default is ``None``.
+            backward_operator: The backward operator. Default is ``None``.
+            mixed_precision: Use mixed precision. Default is ``False``.
+            **models: Additional models.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__(
+            cfg,
+            model,
+            device,
+            forward_operator=forward_operator,
+            backward_operator=backward_operator,
+            mixed_precision=mixed_precision,
+            **models,
+        )
+
+    def _do_iteration(
+        self,
+        data: dict[str, torch.Tensor],
+        loss_fns: dict[str, Callable] | None = None,
+        regularizer_fns: dict[str, Callable] | None = None,
+    ) -> DoIterationOutput:
+        """Do iteration.
+
+        Args:
+            data: Data.
+            loss_fns: Loss fns.
+            regularizer_fns: Regularizer fns.
+
+        Returns:
+            The result.
+
+        Raises:
+            NotImplementedError: If the operation cannot be completed.
+        """
+        if loss_fns is None:
+            loss_fns = {}
+        if regularizer_fns is None:
+            regularizer_fns = {}
+
+        # The first input_image in the iteration is the input_image with the mask applied and no first hidden state.
+        input_image, hidden_state, output_image = None, None, None
+        loss_dicts, regularizer_dicts = [], []
+
+        data = dict_to_device(data, self.device)
+
+        if "noise_model" in self.models:
+            raise NotImplementedError()
+
+        if self.cfg.model.scale_loglikelihood:  # type: ignore
+            scaling_factor = 1.0 * self.cfg.model.scale_loglikelihood / (data["scaling_factor"] ** 2)  # type: ignore
+            scaling_factor = scaling_factor.reshape(-1, 1)  # shape (batch, complex=1)
+            self.logger.debug(f"Scaling factor is: {scaling_factor}")
+        else:
+            # Needs fixing.
+            scaling_factor = torch.tensor([1.0]).to(data["sensitivity_map"].device)  # shape (complex=1, )
+
+        with autocast("cuda", enabled=self.mixed_precision):
+            # sensitivity_map of shape (batch, coil, height,  width, complex=2)
+            data["sensitivity_map"] = self.compute_sensitivity_map(data["sensitivity_map"])
+            data = self.perform_sampling(data)
+            for _ in range(self.cfg.model.steps):  # type: ignore
+                if input_image is not None:
+                    input_image = input_image.permute(0, 2, 3, 1)
+                reconstruction_iter, hidden_state = self.model(
+                    input_image=input_image,
+                    hidden_state=hidden_state,
+                    loglikelihood_scaling=scaling_factor,
+                    **data,
+                )  # list with tensors of shape (batch, complex=2, height, width)
+                # hidden_state of shape (batch, num_hidden_channels, height, width, depth)
+
+                output_image = reconstruction_iter[-1].permute(0, 2, 3, 1)  # shape (batch, height,  width, complex=2)
+
+                loss_dict = {k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in loss_fns}
+                regularizer_dict = {
+                    k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in regularizer_fns
+                }
+
+                for output_image_iter in reconstruction_iter:
+                    output_image_iter = T.modulus(
+                        output_image_iter.permute(0, 2, 3, 1)
+                    )  # shape (batch, height,  width, 2)
+
+                    loss_dict = self.compute_loss_on_data(loss_dict, loss_fns, data, output_image_iter)
+                    regularizer_dict = self.compute_loss_on_data(regularizer_dict, regularizer_fns, data, output_image)
+
+                loss_dict = {k: v / len(reconstruction_iter) for k, v in loss_dict.items()}
+                regularizer_dict = {k: v / len(reconstruction_iter) for k, v in regularizer_dict.items()}
+
+                loss = sum(loss_dict.values()) + sum(regularizer_dict.values())  # type: ignore
+
+            if self.model.training:
+                # TODO(gy): With steps >= 1, calling .backward(retain_grad=False) caused problems.
+                if (self.cfg.model.steps > 1) and (_ < self.cfg.model.steps - 1):  # type: ignore
+                    self._scaler.scale(loss).backward(retain_graph=True)
+                else:
+                    self._scaler.scale(loss).backward()
+
+            # Detach hidden state from computation graph, to ensure loss is only computed per RIM block.
+            hidden_state = hidden_state.detach()  # ty: ignore[unresolved-attribute]
+            input_image = output_image.detach()  # ty: ignore[unresolved-attribute]
+
+            loss_dicts.append(detach_dict(loss_dict))
+            regularizer_dicts.append(detach_dict(regularizer_dict))  # Detach, only used for logging.
+
+        # Add the loss dicts together over RIM steps, divide by the number of steps.
+        loss_dict = reduce_list_of_dicts(loss_dicts, mode="sum", divisor=self.cfg.model.steps)  # type: ignore
+        regularizer_dict = reduce_list_of_dicts(
+            regularizer_dicts,
+            mode="sum",
+            divisor=self.cfg.model.steps,  # type: ignore
+        )
+
+        return DoIterationOutput(
+            output_image=output_image,
+            sensitivity_map=data["sensitivity_map"],
+            data_dict={**loss_dict, **regularizer_dict},
+        )
