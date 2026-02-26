@@ -1,0 +1,85 @@
+load("@aspect_rules_py//py:defs.bzl", "py_binary", "py_library")
+load("@direct_pip//:requirements.bzl", "requirement")
+
+py_library(
+    name = "algorithms",
+    srcs = glob(["algorithms/**/*.py"]),
+    deps = [
+        requirement("torch"),
+        requirement("numpy"),
+    ],
+)
+
+py_library(
+    name = "config",
+    srcs = glob(["config/**/*.py"]),
+    deps = [requirement("omegaconf")],
+)
+
+py_library(
+    name = "data",
+    srcs = glob(["data/**/*.py"]),
+    deps = [
+        requirement("h5py"),
+        requirement("scikit-learn"),
+        requirement("scipy"),
+    ],
+)
+
+py_library(
+    name = "functionals",
+    srcs = glob(["functionals/**/*.py"]),
+    deps = [
+        requirement("scikit-image"),
+    ],
+)
+
+py_library(
+    name = "nn",
+    srcs = glob(["nn/**/*.py"]),
+    deps = [requirement("einops")],
+)
+
+py_library(
+    name = "utils",
+    srcs = glob(["utils/**/*.py"]),
+    deps = [
+        requirement("tqdm"),
+        requirement("tensorboard"),
+    ],
+)
+
+py_library(
+    name = "direct_lib",
+    srcs = glob(["**/*.py"]),
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":algorithms",
+        ":config",
+        ":data",
+        ":functionals",
+        ":nn",
+        ":utils",
+        "//direct/common",
+        "//direct/ssl",
+        requirement("numpy"),
+        requirement("torch"),
+        requirement("torchvision"),
+        requirement("omegaconf"),
+    ],
+)
+
+py_binary(
+    name = "direct",
+    srcs = glob([
+        "cli/**/*.py",
+    ]),
+    data = [
+        "//projects:all_configs",
+    ],
+    main = "cli/cli.py",
+    deps = [
+        ":direct_lib",
+    ],
+)
