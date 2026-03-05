@@ -1,0 +1,1201 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Main engine of DIRECT.
+
+Implements all the main training, testing and validation logic.
+"""
+
+import functools
+import gc
+import logging
+import pathlib
+import signal
+import sys
+import warnings
+from abc import ABC, abstractmethod
+from collections import namedtuple
+from collections.abc import Callable
+from typing import Any
+
+import torch
+from torch import nn
+from torch.amp import GradScaler
+from torch.nn import DataParallel
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torchvision.utils import make_grid
+
+import direct
+from direct.checkpointer import Checkpointer
+from direct.config.defaults import BaseConfig
+from direct.data import transforms as T
+from direct.data.bbox import crop_to_largest
+from direct.data.datasets import ConcatDataset
+from direct.data.samplers import ConcatDatasetBatchSampler
+from direct.exceptions import ProcessKilledException, RejectionSamplingError, TrainingException
+from direct.types import FFTOperator, PathOrString
+from direct.utils import (
+    communication,
+    normalize_image,
+    prefix_dict_keys,
+    reduce_list_of_dicts,
+    str_to_class,
+)
+from direct.utils.events import (
+    CommonMetricPrinter,
+    EventStorage,
+    JSONWriter,
+    TensorboardWriter,
+    get_event_storage,
+)
+from direct.utils.io import write_json
+
+logging.captureWarnings(True)
+
+
+DoIterationOutputBase = namedtuple(
+    "DoIterationOutputBase",
+    ["output_image", "sensitivity_map", "data_dict", "sampling_mask"],
+)
+
+
+class DoIterationOutput(DoIterationOutputBase):
+    """DoIterationOutput."""
+
+    def __new__(cls, output_image, sensitivity_map, data_dict, sampling_mask=None):
+        """Create a new instance.
+
+        Args:
+            output_image: Output image.
+            sensitivity_map: Sensitivity map.
+            data_dict: Data dict.
+            sampling_mask: Sampling mask.
+
+        Returns:
+            ``None``.
+        """
+        return super().__new__(cls, output_image, sensitivity_map, data_dict, sampling_mask)
+
+
+class DataDimensionality:
+    """DataDimensionality."""
+
+    def __init__(self):
+        """Initialize the instance.
+
+        Returns:
+            ``None``.
+        """
+        self._ndim = None
+
+    @property
+    def ndim(self):
+        """Ndim.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            ValueError: If the operation cannot be completed.
+        """
+        if not self._ndim:
+            raise ValueError("ndim needs to be set before it can be called.")
+
+        return self._ndim
+
+    @ndim.setter
+    def ndim(self, ndim):
+        """Ndim.
+
+        Args:
+            ndim: Ndim.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            ValueError: If the operation cannot be completed.
+        """
+        if not isinstance(ndim, int) or ndim <= 0:
+            raise ValueError(f"ndim has to be an integer larger than 0. Got {ndim}.")
+
+        self._ndim = ndim
+
+
+class Engine(ABC, DataDimensionality):
+    """Engine."""
+
+    def __init__(
+        self,
+        cfg: BaseConfig,
+        model: nn.Module,
+        device: str,
+        forward_operator: FFTOperator,
+        backward_operator: FFTOperator,
+        mixed_precision: bool = False,
+        **models: nn.Module,
+    ):
+        """Inits :class:`Engine`.
+
+        Args:
+            cfg: Configuration file.
+            model: Model.
+            device: Device. Can be ``"cuda"`` or ``"cpu"``.
+            forward_operator: The forward operator (e.g. ``direct.data.transforms.fft2``).
+            backward_operator: The backward operator (e.g. ``direct.data.transforms.ifft2``).
+            mixed_precision: Use mixed precision. Default is ``False``.
+            **models: Additional models.
+
+        Returns:
+            ``None``.
+        """
+        self.logger = logging.getLogger(type(self).__name__)
+
+        self.cfg = cfg
+        self.model = model
+        self.models = models
+        self.device = device
+
+        # Operators can be useful in some operations
+        self.forward_operator = forward_operator
+        self.backward_operator = backward_operator
+
+        self.mixed_precision = mixed_precision
+        # `checkpointer` is assigned by :meth:`predict` and :meth:`train`; before then it is
+        # ``None`` and any code path that touches it should go through :meth:`_require_checkpointer`.
+        self.checkpointer: Checkpointer | None = None
+
+        self.__optimizer: torch.optim.Optimizer | None = None
+        self.__lr_scheduler = None
+        self._scaler = GradScaler("cuda", enabled=self.mixed_precision)
+        self.__writers = None
+        self.__bind_sigint_signal()
+
+        DataDimensionality.__init__(self)
+
+    def _require_checkpointer(self) -> Checkpointer:
+        """Returns the configured :class:`Checkpointer`.
+
+        Returns:
+            The result.
+
+        Raises:
+            If no checkpointer has been configured (i.e. neither :meth:`predict` nor :meth:`train` has been called yet).
+        """
+        if self.checkpointer is None:
+            raise RuntimeError("No checkpointer has been configured for this engine.")
+        return self.checkpointer
+
+    def _require_optimizer(self) -> torch.optim.Optimizer:
+        """Returns the configured optimizer, raising if it has not been set yet.
+
+        Returns:
+            The result.
+        """
+        if self.__optimizer is None:
+            raise RuntimeError("No optimizer has been configured for this engine.")
+        return self.__optimizer
+
+    @abstractmethod
+    def build_loss(self) -> dict:
+        """Build loss.
+
+        Returns:
+            The result.
+        """
+
+    @staticmethod
+    def _build_function_class(functions_list, root_module, postfix) -> dict:
+        """Build function class.
+
+        Args:
+            functions_list: Functions list.
+            root_module: Root module.
+            postfix: Postfix.
+
+        Returns:
+            The result.
+        """
+        if not functions_list:
+            return {}
+
+        # _postfix is added as only keys containing loss, metric or reg are logged.
+        functions_dict = {
+            curr_func.split("(")[0] + f"_{postfix}": str_to_class(root_module, curr_func)
+            for curr_func in functions_list
+        }
+        return functions_dict
+
+    def build_metrics(self, metrics_list) -> dict:
+        """Build metrics.
+
+        Args:
+            metrics_list: Metrics list.
+
+        Returns:
+            The result.
+        """
+        return self._build_function_class(metrics_list, "direct.functionals", "metric")
+
+    def build_regularizers(self, regularizers_list) -> dict:
+        """Build regularizers.
+
+        Args:
+            regularizers_list: Regularizers list.
+
+        Returns:
+            The result.
+        """
+        return self._build_function_class(regularizers_list, "direct.functionals", "reg")
+
+    @abstractmethod
+    def _do_iteration(
+        self,
+        data: dict[str, torch.Tensor],
+        loss_fns: dict[str, Callable] | None = None,
+        regularizer_fns: dict[str, Callable] | None = None,
+    ) -> DoIterationOutput:
+        """This is a placeholder for the iteration function.
+
+        This needs to perform the backward pass. If using mixed-precision you need to implement `autocast` as well in
+        this function. It is recommended you raise an error if `self.mixed_precision` is true but mixed precision is not
+        available.
+
+        Args:
+            data: Data.
+            loss_fns: Loss fns.
+            regularizer_fns: Regularizer fns.
+
+        Returns:
+            The result.
+        """
+
+    @torch.no_grad()
+    def predict(
+        self,
+        dataset: Dataset,
+        experiment_directory: pathlib.Path,
+        checkpoint: int | str | pathlib.Path | None = -1,
+        num_workers: int = 6,
+        batch_size: int = 1,
+        crop: str | None = None,
+    ) -> tuple[list[tuple[Any, Any, pathlib.Path]], dict[str, Any]]:
+        """Predict.
+
+        Args:
+            dataset: Dataset.
+            experiment_directory: Experiment directory.
+            checkpoint: Checkpoint.
+            num_workers: Num workers.
+            batch_size: Batch size.
+            crop: Crop.
+
+        Returns:
+            The result.
+        """
+        self.logger.info("Predicting...")
+        torch.cuda.empty_cache()
+        self.ndim = dataset.ndim  # type: ignore
+        self.logger.info("Data dimensionality: %s.", self.ndim)
+
+        self.checkpointer = Checkpointer(
+            save_directory=experiment_directory,
+            save_to_disk=False,
+            model=self.model,  # ty: ignore[invalid-argument-type]
+            **self.models,  # type: ignore
+        )
+        # If integer, latest or None
+        if isinstance(checkpoint, int) or checkpoint == "latest" or checkpoint is None:
+            # Do not load again if we already have loaded the checkpoint.
+            if self.checkpointer.checkpoint_loaded is not checkpoint:
+                iteration_arg: int | str | None = checkpoint  # ty: ignore[invalid-assignment]
+                self.checkpointer.load(iteration=iteration_arg, checkpointable_objects=None)
+        # Otherwise it's a path or a url
+        else:
+            self.checkpointer.load_models_from_file(checkpoint)
+
+        batch_sampler = self.build_batch_sampler(
+            dataset,
+            batch_size=batch_size,
+            sampler_type="sequential",
+            limit_number_of_volumes=None,
+        )
+        # TODO: Batch size can be much larger, perhaps have a different batch size during evaluation.
+        data_loader = self.build_loader(dataset, batch_sampler=batch_sampler, num_workers=num_workers)
+        # Reconstruct volumes and optionally score them with ``inference.metrics``.
+        if self.cfg.inference.metrics:  # ty: ignore[unresolved-attribute]
+            output = self.reconstruct_and_evaluate(data_loader)  # ty: ignore[unresolved-attribute]
+        else:
+            volumes = []
+            for volume, mask, _, filename in self.reconstruct_volumes(
+                data_loader,
+                add_target=False,
+                crop=crop,
+            ):
+                volumes.append((volume, mask, filename))
+            output = (volumes, {})
+
+        return output
+
+    @staticmethod
+    def build_loader(
+        dataset: Dataset,
+        batch_sampler: Sampler | None = None,
+        num_workers: int = 6,
+    ) -> DataLoader:
+        # TODO(jt): Custom memory pinning.
+        """Build loader.
+
+        Args:
+            dataset: Dataset.
+            batch_sampler: Batch sampler.
+            num_workers: Num workers.
+
+        Returns:
+            The result.
+        """
+        loader = DataLoader(
+            dataset=dataset,
+            sampler=None,
+            batch_size=1,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            drop_last=False,
+            shuffle=False,
+            pin_memory=False,  # This can do strange things, and needs a custom implementation.
+            # prefetch_factor=1,
+            # persistent_workers=True,
+        )
+        return loader
+
+    @staticmethod
+    def build_batch_sampler(
+        dataset: Dataset | list[Dataset],
+        batch_size: int,
+        sampler_type: str,
+        **kwargs,
+    ) -> Sampler:
+        """Build batch sampler.
+
+        Args:
+            dataset: Dataset.
+            batch_size: Batch size.
+            sampler_type: Sampler type.
+            **kwargs: Kwargs.
+
+        Returns:
+            The result.
+
+        Raises:
+            ValueError: If the operation cannot be completed.
+        """
+        if sampler_type == "random":
+            if not isinstance(dataset, list) or any(not isinstance(_, Dataset) for _ in dataset):
+                raise ValueError("Random sampler requires a list of datasets as input.")
+            batch_sampler = ConcatDatasetBatchSampler(datasets=dataset, batch_size=batch_size)
+        elif sampler_type == "sequential":
+            sampler = direct.data.samplers.DistributedSequentialSampler(dataset, **kwargs)
+            batch_sampler = direct.data.samplers.BatchVolumeSampler(
+                sampler,
+                batch_size=batch_size,
+            )
+        else:
+            raise ValueError(f"Sampler type {sampler_type} not supported.")
+
+        return batch_sampler
+
+    def training_loop(
+        self,
+        training_datasets: list,  # TODO(jt): Improve typing
+        start_iter: int,
+        validation_datasets: list | None = None,
+        experiment_directory: pathlib.Path | None = None,
+        num_workers: int = 6,
+        start_with_validation: bool = False,
+    ):
+        """Training loop.
+
+        Args:
+            training_datasets: Training datasets.
+            start_iter: Start iter.
+            validation_datasets: Validation datasets.
+            experiment_directory: Experiment directory.
+            num_workers: Num workers.
+            start_with_validation: Start with validation.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            AssertionError: If the operation cannot be completed.
+            RuntimeError: If the operation cannot be completed.
+            TrainingException: If the operation cannot be completed.
+        """
+        self.logger.info(f"Local rank: {communication.get_local_rank()}.")
+        self.models_training_mode()
+
+        loss_fns = self.build_loss()
+        regularizer_fns = self.build_regularizers(self.cfg.training.regularizers)  # type: ignore
+        storage = get_event_storage()
+
+        self.ndim = training_datasets[0].ndim
+        self.logger.info("Data dimensionality: %s.", self.ndim)
+
+        try:
+            training_data = ConcatDataset(training_datasets)
+            if len(training_data) <= 0:
+                raise AssertionError("No training data available")
+        except AssertionError as err:
+            self.logger.info("%s: Terminating training...", err)
+            sys.exit(-1)
+
+        self.logger.info("Concatenated dataset length: %s.", str(len(training_data)))
+        self.logger.info(
+            "Building batch sampler for training set with batch size %s.",
+            self.cfg.training.batch_size,  # type: ignore
+        )
+
+        training_sampler = self.build_batch_sampler(
+            training_datasets,
+            self.cfg.training.batch_size,  # type: ignore
+            "random",
+        )
+        data_loader = self.build_loader(
+            training_data,
+            batch_sampler=training_sampler,
+            num_workers=num_workers,
+        )
+
+        # Convenient shorthand
+        validation_func = functools.partial(
+            self.validation_loop,
+            validation_datasets,
+            None,
+            experiment_directory,
+            num_workers=num_workers,
+        )
+
+        total_iter = self.cfg.training.num_iterations  # type: ignore
+        oom_fail_counter = 0
+        rejection_fail_counter = 0
+        for data, iter_idx in zip(data_loader, range(start_iter, total_iter)):
+            if iter_idx == 0:
+                self.log_first_training_example_and_model(data)
+
+            if start_with_validation and iter_idx == start_iter:
+                self.logger.info(f"Starting with validation at iteration: {iter_idx}.")
+                validation_func(iter_idx)
+            try:
+                iteration_output = self._do_iteration(data, loss_fns, regularizer_fns=regularizer_fns)
+                loss_dict = iteration_output.data_dict
+                if iter_idx == 0 and "sampling_model" in self.models:
+                    self.log_ads_sampling_masks(iteration_output.sampling_mask)
+            except (ProcessKilledException, TrainingException):
+                # If the process is killed, the DoIterationOutput
+                # if saved at state iter_idx, which is the current state,
+                # so the computation can restart from the last iteration.
+                self.logger.exception("Exiting with exception.")
+                self.checkpoint_and_write_to_logs(iter_idx)
+                sys.exit(-1)
+            except RejectionSamplingError as e:
+                # Adaptive mask binarization failed (collapsed probs). Skip batch and retry.
+                if rejection_fail_counter == 10:
+                    self.checkpoint_and_write_to_logs(iter_idx)
+                    raise TrainingException(
+                        f"Rejection sampling exceeded number of tries 10 times in a row: {e}."
+                    ) from e
+                rejection_fail_counter += 1
+                self.logger.info(
+                    "Rejection sampling failed (%s). Skipping batch. Retry %s/10.",
+                    e,
+                    rejection_fail_counter,
+                )
+                self.__optimizer.zero_grad()  # type: ignore
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            except torch.OutOfMemoryError as e:
+                if oom_fail_counter == 3:
+                    self.checkpoint_and_write_to_logs(iter_idx)
+                    raise TrainingException(f"OOM, had three exceptions in a row tries: {e}.") from e
+                oom_fail_counter += 1
+                self.logger.info("OOM Error: %s. Skipping batch. Retry %s/3.", e, oom_fail_counter)
+                self.__optimizer.zero_grad()  # type: ignore
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            except RuntimeError as e:
+                self.checkpoint_and_write_to_logs(iter_idx)
+                self.logger.info(f"Cannot recover from exception {e}. Exiting.")
+                raise RuntimeError(e) from e
+
+            if oom_fail_counter > 0:
+                self.logger.info("Recovered from OOM, skipped batch.")
+            if rejection_fail_counter > 0:
+                self.logger.info("Recovered from rejection sampling failure, skipped batch.")
+            oom_fail_counter = 0
+            rejection_fail_counter = 0
+            # Gradient accumulation
+            if (iter_idx + 1) % self.cfg.training.gradient_steps == 0:  # type: ignore
+                if self.cfg.training.gradient_steps > 1:  # type: ignore
+                    for parameter in self.model.parameters():
+                        if parameter.grad is not None:
+                            # In-place division
+                            parameter.grad.div_(self.cfg.training.gradient_steps)  # type: ignore
+                if self.cfg.training.gradient_clipping > 0.0:  # type: ignore
+                    self._scaler.unscale_(self._require_optimizer())
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.cfg.training.gradient_clipping,  # type: ignore
+                    )
+
+                # Gradient norm
+                if self.cfg.training.gradient_debug:  # type: ignore
+                    warnings.warn(
+                        "Gradient debug set. This will affect training performance. Only use for debugging."
+                        "This message will only be displayed once."
+                    )
+                    parameters = list(filter(lambda p: p.grad is not None, self.model.parameters()))
+                    gradient_norm = sum([parameter.grad.data**2 for parameter in parameters]).sqrt()  # type: ignore
+                    storage.add_scalar("train/gradient_norm", gradient_norm)
+
+                # Same as self.__optimizer.step() for mixed precision.
+                self._scaler.step(self._require_optimizer())
+                # Updates the scale for next iteration.
+                self._scaler.update()
+
+            # TODO: Optimizer is only set in case of training, mypy inference does not seem to be correct.
+            # Perhaps this has to be written differently, though. Related to #83
+            self.__lr_scheduler.step()  # type: ignore
+            storage.add_scalar("lr", self.__optimizer.param_groups[0]["lr"], smoothing_hint=False)  # type: ignore
+
+            self.__optimizer.zero_grad()  # type: ignore
+
+            # Reduce the loss over all devices
+            loss_dict_reduced = communication.reduce_tensor_dict(loss_dict)
+            loss_reduced = sum(loss_dict_reduced.values())
+
+            storage.add_scalars(loss=loss_reduced, **loss_dict_reduced)
+            # Maybe not needed.
+            del data
+
+            self.checkpoint_model_at_interval(iter_idx, total_iter)
+            # Validate before writing so TensorBoard picks up val images/scalars
+            # (including on the final iteration, when there is no later write).
+            self.validate_model_at_interval(validation_func, iter_idx, total_iter)
+            self.write_to_logs_at_interval(iter_idx, total_iter)
+
+            storage.step()
+
+    def validate_model_at_interval(self, func, iter_idx, total_iter):
+        # No validation or anything needed
+        """Validate model at interval.
+
+        Args:
+            func: Func.
+            iter_idx: Iter idx.
+            total_iter: Total iter.
+
+        Returns:
+            ``None``.
+        """
+        if iter_idx >= 5 and (
+            iter_idx % self.cfg.training.validation_steps == 0 or (iter_idx + 1) == total_iter  # type: ignore
+        ):
+            func(iter_idx)
+
+    def checkpoint_model_at_interval(self, iter_idx, total_iter):
+        """Checkpoint model at interval.
+
+        Args:
+            iter_idx: Iter idx.
+            total_iter: Total iter.
+
+        Returns:
+            ``None``.
+        """
+        if iter_idx >= 5 and (
+            (iter_idx % self.cfg.training.checkpointer.checkpoint_steps == 0) or (iter_idx + 1) == total_iter  # type: ignore
+        ):
+            self.logger.info(f"Checkpointing at iteration {iter_idx}.")
+            self._require_checkpointer().save(iter_idx)
+
+    def write_to_logs_at_interval(self, iter_idx, total_iter):
+        """Write to logs at interval.
+
+        Args:
+            iter_idx: Iter idx.
+            total_iter: Total iter.
+
+        Returns:
+            ``None``.
+        """
+        if iter_idx >= 5:
+            # Log every ``logging.log_interval`` iterations (default 20), or at a
+            # validation step or at the end of training.
+            log_interval = int(getattr(self.cfg.logging, "log_interval", 20) or 20)  # ty: ignore[unresolved-attribute]
+            if (
+                iter_idx % log_interval == 0
+                or iter_idx % self.cfg.training.validation_steps == 0  # type: ignore
+                or (iter_idx + 1) == total_iter
+            ):
+                self.write_to_logs()
+
+    def checkpoint_and_write_to_logs(self, iter_idx):
+        """Checkpoint and write to logs.
+
+        Args:
+            iter_idx: Iter idx.
+
+        Returns:
+            ``None``.
+        """
+        if iter_idx >= 5:
+            self._require_checkpointer().save(iter_idx)  # Save checkpoint at kill.
+        self.write_to_logs()
+
+    def validation_loop(
+        self,
+        validation_datasets,
+        loss_fns,
+        experiment_directory,
+        iter_idx,
+        num_workers: int = 6,
+    ):
+        """Validation loop.
+
+        Args:
+            validation_datasets: Validation datasets.
+            loss_fns: Loss fns.
+            experiment_directory: Experiment directory.
+            iter_idx: Iter idx.
+            num_workers: Num workers.
+
+        Returns:
+            ``None``.
+        """
+        if not validation_datasets:
+            return
+
+        storage = get_event_storage()
+
+        for curr_validation_dataset in validation_datasets:
+            curr_dataset_name = curr_validation_dataset.text_description
+            self.logger.info("Evaluating: %s...", curr_dataset_name)
+            self.logger.info("Building dataloader for dataset: %s.", curr_dataset_name)
+
+            curr_batch_sampler = self.build_batch_sampler(
+                curr_validation_dataset,
+                batch_size=self.cfg.validation.batch_size,  # type: ignore
+                sampler_type="sequential",
+                limit_number_of_volumes=None,
+            )
+            curr_data_loader = self.build_loader(
+                curr_validation_dataset,
+                batch_sampler=curr_batch_sampler,
+                num_workers=num_workers,
+            )
+
+            (
+                curr_loss_dict,
+                curr_metrics_per_case,
+                visualize_slices,
+                visualize_mask,
+                visualize_target,
+                visualize_displacement,
+            ) = self.evaluate(
+                curr_data_loader,
+                loss_fns,
+            )
+            if isinstance(visualize_slices, tuple):
+                visualize_slices, visualize_registration_slices = visualize_slices
+            else:
+                visualize_registration_slices = None
+            if isinstance(visualize_target, tuple):
+                visualize_target, visualize_registration_target = visualize_target
+            else:
+                visualize_registration_target = None
+
+            if experiment_directory:
+                json_output_fn = experiment_directory / f"metrics_val_{curr_dataset_name}_{iter_idx}.json"
+                json_output_fn.parent.mkdir(exist_ok=True, parents=True)  # A / in the filename can create a folder
+                if communication.is_main_process():
+                    write_json(
+                        json_output_fn,
+                        curr_metrics_per_case,
+                    )
+                self.logger.info("Wrote per image logs to: %s.", str(json_output_fn))
+
+            # Metric dict still needs to be reduced as it gives values *per* data
+            curr_metric_dict = reduce_list_of_dicts(list(curr_metrics_per_case.values()), mode="average")
+
+            key_prefix = "val/" if not curr_dataset_name else f"val/{curr_dataset_name}/"
+            loss_reduced = sum(curr_loss_dict.values())
+            storage.add_scalars(
+                **{key_prefix + "loss": loss_reduced},
+                **{
+                    **prefix_dict_keys(curr_metric_dict, key_prefix),
+                    **prefix_dict_keys(curr_loss_dict, key_prefix),
+                },
+                smoothing_hint=False,
+            )
+            visualize_slices = self.process_slices_for_visualization(visualize_slices, visualize_target)
+            storage.add_image(f"{key_prefix}prediction", visualize_slices)
+
+            if visualize_registration_slices is not None:
+                visualize_registration_slices = self.process_slices_for_visualization(
+                    visualize_registration_slices, visualize_registration_target
+                )
+                storage.add_image(
+                    f"{key_prefix}registration_prediction",
+                    visualize_registration_slices,
+                )
+
+            if visualize_mask is not None:
+                mask_images = []
+                for image in visualize_mask:
+                    if image.ndim == 3 and image.shape[0] == 3:
+                        # RGB ADS overlay (blue=initial, red=predicted); already in [0, 1].
+                        mask_images.append(image.clamp(0, 1))
+                    else:
+                        mask_images.append(normalize_image(image))
+                visualize_mask = make_grid(
+                    crop_to_largest(  # ty: ignore[invalid-argument-type]
+                        mask_images,
+                        pad_value=0,
+                    ),
+                    nrow=self.cfg.logging.tensorboard.num_images,  # type: ignore
+                    scale_each=True,
+                )
+                storage.add_image(f"{key_prefix}mask", visualize_mask)
+
+            if visualize_displacement is not None:
+                # RGB warped-grid images are already in [0, 1]; only normalize single-channel maps.
+                displacement_images = [
+                    image.clamp(0, 1) if image.shape[0] == 3 else normalize_image(image)
+                    for image in visualize_displacement
+                ]
+                visualize_displacement = make_grid(
+                    crop_to_largest(displacement_images, pad_value=0),  # ty: ignore[invalid-argument-type]
+                    nrow=self.cfg.logging.tensorboard.num_images,  # type: ignore
+                    scale_each=True,
+                )
+                storage.add_image(f"{key_prefix}displacement_field", visualize_displacement)
+
+            if iter_idx // self.cfg.training.validation_steps - 1 == 0:  # type: ignore
+                visualize_target = [normalize_image(image) for image in visualize_target]
+                visualize_target = make_grid(
+                    crop_to_largest(visualize_target, pad_value=0),  # ty: ignore[invalid-argument-type]
+                    nrow=self.cfg.logging.tensorboard.num_images,  # type: ignore
+                    scale_each=True,
+                )
+                storage.add_image(f"{key_prefix}target", visualize_target)
+
+                if visualize_registration_target is not None:
+                    visualize_registration_target = make_grid(
+                        crop_to_largest(  # ty: ignore[invalid-argument-type]
+                            [normalize_image(image) for image in visualize_registration_target],
+                            pad_value=0,
+                        ),
+                        nrow=self.cfg.logging.tensorboard.num_images,  # type: ignore
+                        scale_each=True,
+                    )
+                    storage.add_image(
+                        f"{key_prefix}registration_target",
+                        visualize_registration_target,
+                    )
+
+            self.logger.info(
+                "Done evaluation of %s at iteration %s.",
+                str(curr_dataset_name),
+                str(iter_idx),
+            )
+        self.model.train()
+
+    def process_slices_for_visualization(self, visualize_slices, visualize_target):
+        # Log slices.
+        # Compute the difference as well, and normalize for visualization
+        """Process slices for visualization.
+
+        Args:
+            visualize_slices: Visualize slices.
+            visualize_target: Visualize target.
+
+        Returns:
+            ``None``.
+        """
+        difference_slices = [a - b for a, b in zip(visualize_slices, visualize_target)]
+        # Normalize slices
+        difference_slices = [(d / d.abs().clamp(min=1e-8)) * 0.5 + 0.5 for d in difference_slices]
+        visualize_slices = [normalize_image(image) for image in visualize_slices]
+
+        # Visualize slices, and crop to the largest volume
+        visualize_slices = make_grid(
+            crop_to_largest(visualize_slices + difference_slices, pad_value=0),  # ty: ignore[invalid-argument-type]
+            nrow=self.cfg.logging.tensorboard.num_images,  # type: ignore
+            scale_each=True,
+        )
+        return visualize_slices
+
+    def models_training_mode(self):
+        """Models training mode.
+
+        Returns:
+            ``None``.
+        """
+        self.model.train()
+        for curr_model in self.models:
+            self.models[curr_model].train()
+
+    def models_validation_mode(self):
+        """Models validation mode.
+
+        Returns:
+            ``None``.
+        """
+        self.model.eval()
+        for curr_model in self.models:
+            self.models[curr_model].eval()
+
+    def models_to_device(self):
+        """Models to device.
+
+        Returns:
+            ``None``.
+        """
+        self.model = self.model.to(self.device)
+        for curr_model_name in self.models:
+            self.models[curr_model_name] = self.models[curr_model_name].to(self.device)
+
+    def train(
+        self,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
+        training_datasets: list[Dataset],
+        experiment_directory: pathlib.Path,
+        validation_datasets: list[Dataset] | None = None,
+        resume: bool = False,
+        start_with_validation: bool = False,
+        initialization: PathOrString | None = None,
+        num_workers: int = 6,
+    ) -> None:
+        """Train.
+
+        Args:
+            optimizer: Optimizer.
+            lr_scheduler: Lr scheduler.
+            training_datasets: Training datasets.
+            experiment_directory: Experiment directory.
+            validation_datasets: Validation datasets.
+            resume: Resume.
+            start_with_validation: Start with validation.
+            initialization: Initialization.
+            num_workers: Num workers.
+
+        Returns:
+            ``None``.
+        """
+        self.logger.info("Starting training.")
+        # Can consider not to make this a member of self, but that requires that optimizer is passed to
+        # training_loop()
+        self.__optimizer = optimizer
+        self.__lr_scheduler = lr_scheduler
+
+        self.models_to_device()
+
+        # Optimizer
+        self.__optimizer.zero_grad()  # type: ignore
+
+        # Mixed precision setup. This requires the model to be on the gpu.
+        git_hash = direct.utils.git_hash()
+        checkpointing_metadata = {
+            "__author__": git_hash if git_hash else "N/A",
+            "__version__": direct.__version__,
+            "__mixed_precision__": self.mixed_precision,
+        }
+        if self.mixed_precision:
+            # TODO(jt): Check if on GPU
+            self.logger.info("Using mixed precision training.")
+
+        self.checkpointer = Checkpointer(
+            save_directory=experiment_directory,
+            save_to_disk=bool(communication.is_main_process()),
+            model=self.model,  # type: ignore
+            optimizer=optimizer,  # type: ignore
+            lr_scheduler=lr_scheduler,  # type: ignore
+            scaler=self._scaler,  # type: ignore
+            **checkpointing_metadata,  # type: ignore
+            **self.models,  # type: ignore
+        )
+
+        # Load checkpoint
+        start_iter = 0
+        checkpoint = {}
+
+        if resume:
+            self.logger.info("Attempting to resume...")
+            # This changes the model inplace
+            checkpoint = self.checkpointer.load(iteration="latest")
+            if not checkpoint:
+                self.logger.info("No checkpoint found. Starting from scratch.")
+            else:
+                start_iter = checkpoint["iteration"] + 1
+                self.logger.info(f"Starting from iteration: {start_iter}.")
+
+        if start_iter > 0 and initialization:
+            self.logger.warning(
+                f"Initialization checkpoint set to {initialization},"
+                f" but model will resume training from previous checkpoint. Initialization ignored."
+            )
+        elif initialization:
+            self.logger.info(f"Initializing from {initialization}...")
+            self.checkpointer.load_models_from_file(initialization)
+            start_with_validation = True
+            self.logger.info("Setting start_with_validation to True.")
+
+        if "__version__" in checkpoint:
+            self.logger.info(f"DIRECT version of checkpoint: {checkpoint['__version__']}.")
+            if checkpoint["__version__"] != direct.__version__:
+                self.logger.warning(
+                    f"Current DIRECT version {direct.__version__} is different from the one "
+                    f"this checkpoint is saved with: {checkpoint['__version__']}. This can be fine, "
+                    f"but beware that this can be a source of confusion."
+                )
+
+        if "__author__" in checkpoint:
+            self.logger.info(f"Git hash of checkpoint: {checkpoint['__author__']}.")
+            if checkpoint["__author__"] != direct.utils.git_hash():
+                self.logger.warning(
+                    f"Current git hash {direct.utils.git_hash()} is different from the one "
+                    f"this checkpoint is saved with: {checkpoint['__author__']}. This can be fine, "
+                    f"but beware that this can be a source of confusion."
+                )
+
+        if "__datetime__" in checkpoint:
+            self.logger.info("Checkpoint created at: %s.", checkpoint["__datetime__"])
+
+        if "__mixed_precision__" in checkpoint:
+            if (not self.mixed_precision) and checkpoint["__mixed_precision__"]:
+                self.logger.warning(
+                    "Mixed precision training is not enabled, yet saved checkpoint requests this. "
+                    "Will now enable mixed precision."
+                )
+                self.mixed_precision = True
+            elif not checkpoint["__mixed_precision__"] and self.mixed_precision:
+                self.logger.warning(
+                    "Mixed precision levels of training and loading checkpoint do not match. "
+                    "Requested mixed precision but checkpoint is saved without. "
+                    "This will almost surely lead to performance degradation."
+                )
+
+        if start_with_validation:
+            self.logger.info("Requested to start with validation.")
+
+        self.logger.info(f"World size: {communication.get_world_size()}.")
+        self.logger.info(f"Device count: {torch.cuda.device_count()}.")
+        if communication.get_world_size() > 1:
+            self.model = DistributedDataParallel(
+                self.model,
+                device_ids=[communication.get_local_rank()],
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+
+        # World size > 1 if distributed mode, else allow a DataParallel fallback, can be convenient for debugging.
+        elif torch.cuda.device_count() > 1 and communication.get_world_size() == 1:
+            self.model = DataParallel(self.model)
+
+        self.__writers = (
+            [
+                JSONWriter(experiment_directory / "metrics.json"),
+                CommonMetricPrinter(self.cfg.training.num_iterations),  # type: ignore
+                TensorboardWriter(experiment_directory / "tensorboard"),
+            ]
+            if communication.is_main_process()
+            else []
+        )
+
+        with EventStorage(start_iter):
+            self.training_loop(
+                training_datasets,
+                start_iter,
+                validation_datasets,
+                experiment_directory=experiment_directory,
+                num_workers=num_workers,
+                start_with_validation=start_with_validation,
+            )
+
+        self.logger.info("Training completed.")
+
+    @abstractmethod
+    def reconstruct_volumes(self, *args, **kwargs):
+        """Reconstruct volumes.
+
+        Args:
+            *args: Args.
+            **kwargs: Kwargs.
+
+        Returns:
+            ``None``.
+        """
+
+    @abstractmethod
+    def evaluate(self, *args, **kwargs):
+        """Evaluate.
+
+        Args:
+            *args: Args.
+            **kwargs: Kwargs.
+
+        Returns:
+            ``None``.
+        """
+
+    def log_process(self, idx, total):
+        """Log process.
+
+        Args:
+            idx: Idx.
+            total: Total.
+
+        Returns:
+            ``None``.
+        """
+        if idx % (total // 10) == 0 or total == (idx + 1):
+            self.logger.info(f"Progress: {(idx + 1) / total * 100:.2f}%.")
+
+    def log_first_training_example_and_model(self, data):
+        """Log first training example and model.
+
+        Args:
+            data: Data.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            NotImplementedError: If the operation cannot be completed.
+        """
+        storage = get_event_storage()
+        self.logger.info(f"First case: slice_no: {data['slice_no'][0]}, filename: {data['filename'][0]}.")
+
+        # TODO(jt): Cleaner, loop over types of images
+        first_sampling_mask = data["sampling_mask"][0][0][..., 0]
+        first_target = data["target"][0]
+
+        if self.ndim == 3:
+            # If we have multiple slice masks, we need to concatenate them.
+            if first_sampling_mask.shape[0] > 1:
+                first_sampling_mask = torch.cat(
+                    [first_sampling_mask[_] for _ in range(first_sampling_mask.shape[0])],
+                    dim=-2,
+                )
+            else:
+                first_sampling_mask = first_sampling_mask.squeeze(0)
+
+            first_target = torch.cat([first_target[_] for _ in range(first_target.shape[0])], dim=-2)
+        elif self.ndim > 3:
+            raise NotImplementedError
+
+        storage.add_image("train/mask", first_sampling_mask.unsqueeze(0))
+        storage.add_image(
+            "train/target",
+            normalize_image(first_target.unsqueeze(0)),
+        )
+
+        if "initial_image" in data:
+            storage.add_image(
+                "train/initial_image",
+                normalize_image(T.modulus(data["initial_image"][0]).unsqueeze(0)),
+            )
+
+        # TODO: Add graph
+
+        self.write_to_logs()
+
+    def log_ads_sampling_masks(self, sampling_mask: torch.Tensor | None) -> None:
+        """Log ADS initial vs predicted mask overlay after the first training step.
+
+        Blue = initial (ACS/init) samples, red = newly acquired / predicted samples.
+
+        Args:
+            sampling_mask: Sampling mask.
+
+        Returns:
+            ``None``.
+        """
+        if sampling_mask is None:
+            return
+
+        from direct.nn.adaptive.utils import sampling_mask_rgb_overlay, split_sampling_mask_history
+
+        storage = get_event_storage()
+        mask = sampling_mask[0]
+        # Drop coil dim if present.
+        if mask.ndim >= 1 and mask.shape[0] == 1:
+            mask = mask.squeeze(0)
+
+        if self.ndim == 3:
+            # Concatenate time/slices along height for a single TB image.
+            if mask.shape[0] > 1:
+                mask = torch.cat([mask[_] for _ in range(mask.shape[0])], dim=-2 if mask.ndim >= 3 else 0)
+            else:
+                mask = mask.squeeze(0)
+
+        split = split_sampling_mask_history(mask)
+        if split is None:
+            storage.add_image("train/mask_final", mask.unsqueeze(0) if mask.ndim == 2 else mask[:1])
+            self.write_to_logs()
+            return
+
+        initial, final = split
+        overlay = sampling_mask_rgb_overlay(initial, final)
+        storage.add_image("train/mask_initial", initial.unsqueeze(0))
+        storage.add_image("train/mask_final", final.unsqueeze(0))
+        storage.add_image("train/mask_overlay", overlay)
+        self.write_to_logs()
+
+    def write_to_logs(self):
+        """Write to logs.
+
+        Returns:
+            ``None``.
+        """
+        if self.__writers is not None:
+            for writer in self.__writers:
+                writer.write()
+
+    def __bind_sigint_signal(self):
+        """Bind SIGINT signal to handle preemption or other kill of the process.
+
+        Returns:
+            ``None``.
+        """
+
+        # pylint: disable = E1101
+        def raise_process_killed_error(signal_id, _):
+            """Raise the ProcessKilledError.
+
+            Args:
+                signal_id: Signal id.
+                _: Argument.
+
+            Returns:
+                ``None``.
+            """
+            self.logger.info(f"Received {signal.Signals(signal_id).name} Shutting down...")
+            raise ProcessKilledException(signal_id, signal.Signals(signal_id).name)
+
+        signal.signal(signalnum=signal.SIGINT, handler=raise_process_killed_error)
