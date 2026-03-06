@@ -1,0 +1,757 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""direct.environment module."""
+
+import argparse
+import importlib.metadata
+import logging
+import os
+import pathlib
+import platform
+import sys
+import tempfile
+from collections import namedtuple
+from collections.abc import Callable
+
+import torch
+from omegaconf import DictConfig, ListConfig, OmegaConf
+
+import direct.utils.logging
+from direct.config.defaults import DefaultConfig, InferenceConfig, PhysicsConfig, TrainingConfig, ValidationConfig
+from direct.types import FFTOperator
+from direct.utils import communication, count_parameters, filter_arguments_by_signature, str_to_class
+from direct.utils.io import check_is_valid_url, read_text_from_url
+from direct.utils.logging import setup
+
+logger = logging.getLogger(__name__)
+
+# Environmental variables
+DIRECT_ROOT_DIR = pathlib.Path(pathlib.Path(__file__).resolve().parent.parent)
+
+
+def resolve_cache_dir() -> pathlib.Path:
+    """Resolve cache dir.
+
+    Returns:
+        The result.
+    """
+    cache_dir_path = pathlib.Path(os.environ.get("DIRECT_CACHE_DIR", str(DIRECT_ROOT_DIR)))
+    # Check if the directory is writable
+    if os.access(str(cache_dir_path), os.W_OK):
+        logger.info("Using cache directory: %s", cache_dir_path)
+        return cache_dir_path
+    if "DIRECT_CACHE_DIR" in os.environ:
+        env_path = pathlib.Path(os.environ["DIRECT_CACHE_DIR"])
+        if os.access(str(env_path), os.W_OK):
+            logger.info("Using cache directory: %s", env_path)
+            return env_path
+    try:
+        tmpdir = os.environ.get("TMPDIR", tempfile.gettempdir())
+        cache_dir = pathlib.Path(tmpdir) / "direct_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if os.access(str(cache_dir), os.W_OK):
+            logger.info("Using cache directory: %s", cache_dir)
+            return cache_dir
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Failed to create or access cache directory in TMPDIR: %s", e)
+
+    # Fallback to a default tmp directory
+    fallback = pathlib.Path(tempfile.gettempdir()) / "direct_cache"
+    fallback.mkdir(parents=True, exist_ok=True)
+    logger.warning("Falling back to cache directory: %s", fallback)
+    return fallback
+
+
+DIRECT_CACHE_DIR = resolve_cache_dir()
+DIRECT_MODEL_DOWNLOAD_DIR = DIRECT_CACHE_DIR / "downloaded_models"
+
+
+def collect_env_info() -> str:
+    """Collects environment information.
+
+    Returns:
+        Environment information as a formatted string.
+    """
+    SystemEnv = namedtuple(
+        "SystemEnv",
+        [
+            "torch_version",
+            "is_debug_build",
+            "cuda_compiled_version",
+            "python_version",
+            "python_platform",
+            "os",
+            "libc_version",
+            "is_cuda_available",
+            "cuda_runtime_version",
+            "cudnn_version",
+            "pip_packages",
+            "cpu_info",
+        ],
+    )
+
+    def safe_version(pkg):
+        """Safe version.
+
+        Args:
+            pkg: Pkg.
+
+        Returns:
+            ``None``.
+        """
+        try:
+            return importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            return "Not installed"
+
+    def get_cudnn_version():
+        """Get cudnn version.
+
+        Returns:
+            ``None``.
+        """
+        try:
+            return str(torch.backends.cudnn.version()) if torch.backends.cudnn.is_available() else "Unavailable"
+        except Exception:  # noqa: BLE001
+            return "Unknown"
+
+    def get_cpu_info():
+        """Get cpu info.
+
+        Returns:
+            ``None``.
+        """
+        try:
+            return platform.processor() or platform.machine()
+        except Exception:  # noqa: BLE001
+            return "Unknown"
+
+    pip_packages = {pkg: safe_version(pkg) for pkg in ["torch", "numpy", "triton", "optree", "mypy", "flake8", "onnx"]}
+    pip_str = "\n    " + "\n    ".join(f"{pkg}=={ver}" for pkg, ver in pip_packages.items())
+
+    def pretty_print(env):
+        """Pretty print.
+
+        Args:
+            env: Env.
+
+        Returns:
+            ``None``.
+        """
+        lines = [
+            f"PyTorch version: {env.torch_version}",
+            f"Is debug build: {env.is_debug_build}",
+            f"CUDA used to build PyTorch: {env.cuda_compiled_version}",
+            f"Python version: {env.python_version}",
+            f"Python platform: {env.python_platform}",
+            f"OS: {env.os}",
+            f"Libc version: {env.libc_version}",
+            f"Is CUDA available: {env.is_cuda_available}",
+            f"CUDA runtime version: {env.cuda_runtime_version}",
+            f"cuDNN version: {env.cudnn_version}",
+            f"CPU info: {env.cpu_info}",
+            f"Relevant pip packages: {env.pip_packages}",
+        ]
+        return "\n" + "\n".join(lines)
+
+    return pretty_print(
+        SystemEnv(
+            torch_version=torch.__version__,
+            is_debug_build=str(getattr(torch.version, "debug", "Unknown")),
+            cuda_compiled_version=getattr(torch.version, "cuda", "None"),
+            python_version=sys.version.replace("\n", " "),
+            python_platform=platform.platform(),
+            os=platform.platform(),
+            libc_version="-".join(platform.libc_ver()) if sys.platform.startswith("linux") else "N/A",
+            is_cuda_available=str(torch.cuda.is_available()),
+            cuda_runtime_version=getattr(torch.version, "cuda", "No CUDA"),
+            cudnn_version=get_cudnn_version(),
+            pip_packages=pip_str,
+            cpu_info=get_cpu_info(),
+        )
+    )
+
+
+def load_model_config_from_name(model_name: str) -> Callable:
+    """Load specific configuration module for models based on their name.
+
+    Args:
+        model_name: Path to model relative to direct.nn.
+
+    Returns:
+        Model configuration.
+    """
+    module_path = f"direct.nn.{model_name.split('.')[0].lower()}.config"
+    model_name += "Config"
+    config_name = model_name.split(".")[-1]
+    try:
+        model_cfg = str_to_class(module_path, config_name)
+    except (AttributeError, ModuleNotFoundError) as e:
+        logger.error(f"Path {module_path} for config_name {config_name} does not exist (err = {e}).")
+        sys.exit(-1)
+    return model_cfg
+
+
+def load_model_from_name(model_name: str) -> Callable:
+    """Load model based on `model_name`.
+
+    Args:
+        model_name: Model name as in direct.nn.
+
+    Returns:
+        Model class.
+    """
+    module_path = f"direct.nn.{'.'.join([_.lower() for _ in model_name.split('.')[:-1]])}"
+    module_name = model_name.split(".")[-1]
+    try:
+        model = str_to_class(module_path, module_name)
+    except (AttributeError, ModuleNotFoundError) as e:
+        logger.error(f"Path {module_path} for model_name {module_name} does not exist (err = {e}).")
+        sys.exit(-1)
+
+    return model
+
+
+def load_dataset_config(dataset_name: str) -> Callable:
+    """Load specific dataset configuration for dataset based on `dataset_name`.
+
+    Args:
+        dataset_name: Name of dataset.
+
+    Returns:
+        Dataset configuration.
+    """
+    dataset_config = str_to_class("direct.data.datasets_config", dataset_name + "Config")
+    return dataset_config
+
+
+def build_operators(cfg: PhysicsConfig) -> tuple[FFTOperator, FFTOperator]:
+    """Builds operators from configuration.
+
+    Args:
+        cfg: Cfg.
+
+    Returns:
+        The result.
+    """
+    # Get the operators
+    forward_operator = str_to_class("direct.data.transforms", cfg.forward_operator)
+    backward_operator = str_to_class("direct.data.transforms", cfg.backward_operator)
+    return forward_operator, backward_operator
+
+
+def setup_logging(
+    machine_rank: int,
+    output_directory: pathlib.Path,
+    run_name: str,
+    cfg_filename: pathlib.Path | str,
+    cfg: DefaultConfig,
+    debug: bool,
+) -> None:
+    """Logs environment information.
+
+    Args:
+        machine_rank: Machine rank.
+        output_directory: Path to output directory.
+        run_name: Name of run.
+        cfg_filename: Name of configuration file.
+        cfg: Configuration file.
+        debug: Whether the debug mode is enabled.
+
+    Returns:
+        ``None``.
+    """
+    # Setup logging
+    log_file = output_directory / f"log_{machine_rank}_{communication.get_local_rank()}.txt"
+
+    setup(
+        use_stdout=communication.is_main_process() or debug,
+        filename=log_file,
+        log_level=("INFO" if not debug else "DEBUG"),
+    )
+    logger.info("Machine rank: %s", machine_rank)
+    logger.info("Local rank: %s", communication.get_local_rank())
+    logger.info("Logging: %s", log_file)
+    logger.info("Saving to: %s", output_directory)
+    logger.info("Run name: %s", run_name)
+    logger.info("Config file: %s", cfg_filename)
+    logger.info("CUDA %s - cuDNN %s", torch.version.cuda, torch.backends.cudnn.version())
+    logger.info("Environment information: %s", collect_env_info())
+    logger.info("DIRECT version: %s", direct.__version__)
+    git_hash = direct.utils.git_hash()
+    logger.info("Git hash: %s", git_hash if git_hash else "N/A")
+    logger.info("Configuration: %s", OmegaConf.to_yaml(cfg))
+
+
+def load_models_into_environment_config(cfg_from_file: DictConfig) -> tuple[dict, DictConfig]:
+    """Load the configuration for the models.
+
+    Args:
+        cfg_from_file: Omegaconf configuration.
+
+    Returns:
+        Models dictionary and models configuration dictionary.
+    """
+    cfg = {"model": cfg_from_file.model}
+
+    if "additional_models" in cfg_from_file:
+        cfg = {**cfg, **cfg_from_file.additional_models}
+    # Parse config of additional models
+    # TODO: Merge this with the normal model config loading.
+    models_config = {}
+    models = {}
+    for curr_model_name in cfg:
+        if "model_name" not in cfg[curr_model_name]:
+            logger.error(f"Model {curr_model_name} has no model_name.")
+            sys.exit(-1)
+
+        curr_model_cfg = cfg[curr_model_name]
+        model_name = curr_model_cfg.model_name
+        models[curr_model_name] = load_model_from_name(model_name)
+
+        models_config[curr_model_name] = OmegaConf.merge(load_model_config_from_name(model_name), curr_model_cfg)
+
+    return models, OmegaConf.merge(models_config)  # type: ignore
+
+
+def initialize_models_from_config(
+    cfg: DictConfig, models: dict, forward_operator: Callable, backward_operator: Callable, device: str
+) -> tuple[torch.nn.Module, dict]:
+    """Creates models from config.
+
+    Args:
+        cfg: Configuration.
+        models: Models dictionary including configurations.
+        forward_operator: Forward operator.
+        backward_operator: Backward operator.
+        device: Type of device.
+
+    Returns:
+        Model.
+        Additional models.
+    """
+    # Create the model
+    logger.info("Building models.")
+
+    operator_kwargs = {"forward_operator": forward_operator, "backward_operator": backward_operator}
+
+    # TODO(jt): Model name is not used here.
+    additional_models = {}
+    for k, v in cfg.additional_models.items():
+        # Remove model_name key
+        curr_model = models[k]
+        curr_model_cfg = {kk: vv for kk, vv in v.items() if kk not in ["engine_name", "model_name"]}
+        curr_model_cfg.update(operator_kwargs)
+        # Drop keys unknown to the constructor (e.g. ModConv defaults on legacy modules).
+        # warn_dropped=True so typos / stale YAML keys are not applied silently.
+        additional_models[k] = curr_model(
+            **filter_arguments_by_signature(curr_model, curr_model_cfg, warn_dropped=True)
+        )
+
+    model_cfg = {k: v for (k, v) in cfg.model.items() if k != "engine_name"}
+    model_cfg.update(operator_kwargs)
+    model = models["model"](**filter_arguments_by_signature(models["model"], model_cfg, warn_dropped=True)).to(device)
+
+    # Log total number of parameters
+    count_parameters({"model": model, **additional_models})
+    return model, additional_models
+
+
+def setup_engine(
+    cfg: DictConfig,
+    device: str,
+    model: torch.nn.Module,
+    additional_models: dict,
+    forward_operator: Callable | object | None = None,
+    backward_operator: Callable | object | None = None,
+    mixed_precision: bool = False,
+):
+    """Setups engine.
+
+    Args:
+        cfg: Configuration.
+        device: Type of device.
+        model: Model.
+        additional_models: Additional models.
+        forward_operator: Forward operator.
+        backward_operator: Backward operator.
+        mixed_precision: Whether to enable mixed precision or not. Default is ``False``.
+
+    Returns:
+        Experiment Engine.
+    """
+
+    # There is a bit of repetition here, but the warning provided is more descriptive
+    # TODO(jt): Try to find a way to combine this with the setup above.
+    model_name_short = cfg.model.model_name.split(".")[0]
+    engine_name = cfg.model.engine_name if cfg.model.engine_name else cfg.model.model_name.split(".")[-1] + "Engine"
+
+    try:
+        engine_class = str_to_class(
+            f"direct.nn.{model_name_short.lower()}.{model_name_short.lower()}_engine",
+            engine_name,
+        )
+    except (AttributeError, ModuleNotFoundError) as e:
+        logger.error(f"Engine does not exist for {cfg.model.model_name} (err = {e}).")
+        sys.exit(-1)
+
+    engine = engine_class(
+        cfg,
+        model,
+        device=device,
+        forward_operator=forward_operator,
+        backward_operator=backward_operator,
+        mixed_precision=mixed_precision,
+        **additional_models,
+    )
+    return engine
+
+
+def extract_names(cfg):
+    """Extract names.
+
+    Args:
+        cfg: Cfg.
+
+    Returns:
+        ``None``.
+
+    Raises:
+        ValueError: If the operation cannot be completed.
+    """
+    cfg = cfg.copy()
+    if isinstance(cfg, DictConfig):
+        if "name" not in cfg:
+            raise ValueError("`name` needs to be present in config.")
+        curr_name = cfg["name"]
+
+    elif isinstance(cfg, ListConfig):
+        return [extract_names(v) for v in cfg]
+
+    else:
+        raise ValueError(f"Expected DictConfig or ListConfig. Got {type(cfg)}.")
+
+    return curr_name, cfg
+
+
+def setup_common_environment(
+    run_name: str,
+    base_directory: pathlib.Path,
+    cfg_pathname: pathlib.Path | str,
+    device: str,
+    machine_rank: int,
+    mixed_precision: bool,
+    debug: bool = False,
+):
+    """Setup environment.
+
+    Args:
+        run_name: Run name.
+        base_directory: Base directory path.
+        cfg_pathname: Path or url to configuratio file.
+        device: Device type.
+        machine_rank: Machine rank.
+        mixed_precision: Whether to enable mixed precision or not. Default is ``False``.
+        debug: Whether the debug mode is enabled.
+
+    Returns:
+        Common Environment.
+    """
+
+    logger = logging.getLogger()
+
+    experiment_dir = base_directory / run_name
+    if communication.get_local_rank() == 0:
+        # Want to prevent multiple workers from trying to write a directory
+        # This is required in the logging below
+        experiment_dir.mkdir(parents=True, exist_ok=True)
+    communication.synchronize()  # Ensure folders are in place.
+
+    # Load configs from YAML file to check which model needs to be loaded.
+    # Can also be loaded from a URL.  ``OmegaConf.create`` / ``load`` may return a
+    # ``ListConfig`` for some inputs, but our DIRECT configs are always mappings; narrow the
+    # static type so the dict-style accesses below typecheck.
+    cfg_from_external_source: DictConfig
+    if check_is_valid_url(cfg_pathname):
+        cfg_from_external_source = OmegaConf.create(read_text_from_url(cfg_pathname))
+    else:
+        cfg_from_external_source = OmegaConf.load(cfg_pathname)  # ty: ignore[invalid-assignment]
+
+    # Load the default configs to ensure type safety
+    cfg = OmegaConf.structured(DefaultConfig)
+
+    models, models_config = load_models_into_environment_config(cfg_from_external_source)
+    cfg.model = models_config.model
+    del models_config["model"]
+    cfg.additional_models = models_config
+
+    # Only materialize training/validation/inference when present in the YAML.
+    # Inference-only configs can omit training and validation entirely.
+    cfg_from_file_new = cfg_from_external_source.copy()
+    for key in cfg_from_external_source:
+        # TODO: This does not really do a full validation.
+        # BODY: This will be handeled once Hydra is implemented.
+        if key in ["models", "additional_models"]:  # Still handled separately
+            continue
+
+        if key in ["training", "validation", "inference"]:
+            if not cfg_from_external_source[key]:
+                logger.info(f"key {key} missing in config.")
+                continue
+
+            if key == "training":
+                cfg.training = OmegaConf.structured(TrainingConfig)
+            elif key == "validation":
+                cfg.validation = OmegaConf.structured(ValidationConfig)
+            else:
+                cfg.inference = OmegaConf.structured(InferenceConfig)
+
+            if key in ["training", "validation"]:
+                dataset_cfg_from_file = extract_names(cfg_from_external_source[key].datasets)
+                for idx, (dataset_name, dataset_config) in enumerate(dataset_cfg_from_file):
+                    cfg_from_file_new[key].datasets[idx] = dataset_config
+                    cfg[key].datasets.append(load_dataset_config(dataset_name))  # pylint: disable = E1136
+            else:
+                dataset_name, dataset_config = extract_names(cfg_from_external_source[key].dataset)
+                cfg_from_file_new[key].dataset = dataset_config
+                cfg[key].dataset = load_dataset_config(dataset_name)  # pylint: disable = E1136
+
+            cfg[key] = OmegaConf.merge(cfg[key], cfg_from_file_new[key])  # pylint: disable = E1136, E1137
+            continue
+
+        cfg[key] = OmegaConf.merge(cfg[key], cfg_from_file_new[key])  # pylint: disable = E1136, E1137
+
+    # Make configuration read only.
+    # TODO(jt): Does not work when indexing config lists.
+    # OmegaConf.set_readonly(cfg, True)
+    setup_logging(machine_rank, experiment_dir, run_name, cfg_pathname, cfg, debug)
+    forward_operator, backward_operator = build_operators(cfg.physics)
+
+    model, additional_models = initialize_models_from_config(cfg, models, forward_operator, backward_operator, device)
+
+    engine = setup_engine(
+        cfg,
+        device,
+        model,
+        additional_models,
+        forward_operator=forward_operator,
+        backward_operator=backward_operator,
+        mixed_precision=mixed_precision,
+    )
+
+    environment = namedtuple(
+        "environment",
+        ["cfg", "experiment_dir", "engine"],
+    )
+    return environment(cfg, experiment_dir, engine)
+
+
+def setup_training_environment(
+    run_name: str,
+    base_directory: pathlib.Path,
+    cfg_filename: pathlib.Path | str,
+    device: str,
+    machine_rank: int,
+    mixed_precision: bool,
+    debug: bool = False,
+):
+    """Setup training environment.
+
+    Args:
+        run_name: Run name.
+        base_directory: Base directory path.
+        cfg_filename: Path or url to configuratio file.
+        device: Device type.
+        machine_rank: Machine rank.
+        mixed_precision: Whether to enable mixed precision or not. Default is ``False``.
+        debug: Whether the debug mode is enabled.
+
+    Returns:
+        Training Environment.
+    """
+
+    env = setup_common_environment(
+        run_name,
+        base_directory,
+        cfg_filename,
+        device,
+        machine_rank,
+        mixed_precision,
+        debug=debug,
+    )
+    # Write config file to experiment directory.
+    config_file_in_project_folder = env.experiment_dir / "config.yaml"
+    logger.info("Writing configuration file to: %s", config_file_in_project_folder)
+    if communication.is_main_process():
+        with open(config_file_in_project_folder, "w", encoding="utf-8") as f:
+            f.write(OmegaConf.to_yaml(env.cfg))
+    communication.synchronize()
+
+    return env
+
+
+def setup_testing_environment(
+    run_name: str,
+    base_directory: pathlib.Path,
+    device: str,
+    machine_rank: int,
+    mixed_precision: bool,
+    cfg_pathname: pathlib.Path | str | None = None,
+    debug: bool = False,
+):
+    """Setup testing environment.
+
+    Args:
+        run_name: Run name.
+        base_directory: Base directory path.
+        device: Device type.
+        machine_rank: Machine rank.
+        mixed_precision: Whether to enable mixed precision or not. Default is ``False``.
+        cfg_pathname: Path or url to configuration file.
+        debug: Whether the debug mode is enabled.
+
+    Returns:
+        Testing Environment.
+    """
+    if cfg_pathname is None:  # If None, try to load from base experiment directory
+        cfg_pathname = base_directory / run_name / "config.yaml"
+
+    # If not an URL, check if it exists
+    if not check_is_valid_url(cfg_pathname) and not pathlib.Path(cfg_pathname).exists():
+        raise FileNotFoundError(f"Config file {cfg_pathname} does not exist.")
+
+    env = setup_common_environment(
+        run_name,
+        base_directory,
+        cfg_pathname,
+        device,
+        machine_rank,
+        mixed_precision,
+        debug=debug,
+    )
+
+    environment = namedtuple(
+        "environment",
+        ["cfg", "engine"],
+    )
+    return environment(env.cfg, env.engine)
+
+
+def setup_inference_environment(
+    run_name: str,
+    base_directory: pathlib.Path,
+    device: str,
+    machine_rank: int,
+    mixed_precision: bool,
+    cfg_file: pathlib.Path | str | None = None,
+    debug: bool = False,
+):
+    """Setup inference environment.
+
+    Args:
+        run_name: Run name.
+        base_directory: Base directory path.
+        device: Device type.
+        machine_rank: Machine rank.
+        mixed_precision: Whether to enable mixed precision or not. Default is ``False``.
+        cfg_file: Path or url to configuration file.
+        debug: Whether the debug mode is enabled.
+
+    Returns:
+        Inference Environment.
+    """
+    env = setup_testing_environment(
+        run_name, base_directory, device, machine_rank, mixed_precision, cfg_file, debug=debug
+    )
+
+    environment = namedtuple(
+        "environment",
+        ["cfg", "engine"],
+    )
+    return environment(env.cfg, env.engine)
+
+
+class Args(argparse.ArgumentParser):
+    """Defines global default arguments."""
+
+    def __init__(self, epilog=None, add_help=True, **overrides):
+        """Inits Args.
+
+        Args:
+            epilog: Text to display after the argument help. Default is ``None``.
+            add_help: Add a -h/--help option to the parser. Default is ``True``.
+            **overrides: Keyword arguments used to override default argument values
+
+        Returns:
+            ``None``.
+        """
+        super().__init__(epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter, add_help=add_help)
+
+        self.add_argument(
+            "--device",
+            type=str,
+            default="cuda",
+            help='Which device to train on. Set to "cuda" to use the GPU.',
+        )
+        self.add_argument("--seed", default=42, type=int, help="Seed for random number generators.")
+        self.add_argument("--num-workers", type=int, default=4, help="Number of workers.")
+        self.add_argument("--mixed-precision", help="Use mixed precision.", action="store_true")
+        self.add_argument("--debug", help="Set debug mode true.", action="store_true")
+
+        self.add_argument("--num-gpus", type=int, default=1, help="# GPUs per machine.")
+        self.add_argument("--num-machines", type=int, default=1, help="# of machines.")
+        self.add_argument(
+            "--machine-rank",
+            type=int,
+            default=0,
+            help="the rank of this machine (unique per machine).",
+        )
+        self.add_argument(
+            "--initialization-images",
+            help="Path to images which will be used as initialization to the model. "
+            "The filenames assumed to be the same as the images themselves. If these are h5 files, "
+            "the key to read in the h5 has to be set in the configuration in the dataset.input_image_key.",
+            required=False,
+            nargs="+",
+            type=pathlib.Path,
+        )
+        self.add_argument(
+            "--initialization-kspace",
+            help="Path to kspace which will be used as initialization to the model. "
+            "The filenames assumed to be the same as the images themselves. If these are h5 files, "
+            "the key to read in the h5 has to be set in the configuration in the dataset.input_image_key.",
+            required=False,
+            nargs="+",
+            type=pathlib.Path,
+        )
+        self.add_argument(
+            "--noise",
+            help="Path to json file mapping relative filename to noise estimates. Path to training and validation data",
+            required=False,
+            nargs="+",
+            type=pathlib.Path,
+        )
+
+        # Taken from: https://github.com/facebookresearch/detectron2/blob/bd2ea475b693a88c063e05865d13954d50242857/detectron2/engine/defaults.py#L49
+        # PyTorch still may leave orphan processes in multi-gpu training. Therefore we use a deterministic way
+        # to obtain port, so that users are aware of orphan processes by seeing the port occupied.
+        port = 2**15 + 2**14 + hash(os.getuid()) % 2**14
+        self.add_argument(
+            "--dist-url",
+            default=f"tcp://127.0.0.1:{port}",
+            help="initialization URL for pytorch distributed backend. See "
+            "https://pytorch.org/docs/stable/distributed.html for details.",
+        )
+
+        self.set_defaults(**overrides)
