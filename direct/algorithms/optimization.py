@@ -1,0 +1,156 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""General mathematical optimization techniques."""
+
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+
+import torch
+
+
+class Algorithm(ABC):
+    """Base class for implementing mathematical optimization algorithms."""
+
+    def __init__(self, max_iter: int = 30):
+        """Initialize the instance.
+
+        Args:
+            max_iter: Max iter.
+
+        Returns:
+            ``None``.
+        """
+        self.max_iter = max_iter
+        self.iter = 0
+
+    @abstractmethod
+    def _update(self):
+        """Abstract method for updating the algorithm's parameters.
+
+        Returns:
+            ``None``.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def _fit(self, *args, **kwargs):
+        """Abstract method for fitting the algorithm.
+
+        Args:
+            *args: Tuple of arguments.
+            **kwargs: Keyword arguments.
+
+        Returns:
+            ``None``.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def _done(self) -> bool:
+        """Abstract method for checking if the algorithm has ran for `max_iter`.
+
+        Returns:
+            The result.
+        """
+        raise NotImplementedError
+
+    def update(self) -> None:
+        """Update the algorithm's parameters and increment the iteration count.
+
+        Returns:
+            ``None``.
+        """
+        self._update()
+        self.iter += 1
+
+    def done(self) -> bool:
+        """Check if the algorithm has converged.
+
+        Returns:
+            Whether the algorithm has converged or not.
+        """
+        return self._done()
+
+    def fit(self, *args, **kwargs) -> None:
+        """Fit the algorithm.
+
+        Args:
+            *args: Tuple of arguments for `_fit` method.
+            **kwargs: Keyword arguments for `_fit` method.
+
+        Returns:
+            ``None``.
+        """
+        self._fit(*args, **kwargs)
+        while not self.done():
+            self.update()
+
+
+class MaximumEigenvaluePowerMethod(Algorithm):
+    """A class for solving the maximum eigenvalue problem using the Power Method."""
+
+    def __init__(
+        self,
+        forward_operator: Callable,
+        norm_func: Callable | None = None,
+        max_iter: int = 30,
+    ):
+        """Inits :class:`MaximumEigenvaluePowerMethod`.
+
+        Args:
+            forward_operator: The forward operator for the problem.
+            norm_func: An optional function for normalizing the eigenvector. Default is ``None``.
+            max_iter: Maximum number of iterations to run the algorithm. Default is ``30``.
+
+        Returns:
+            ``None``.
+        """
+        self.forward_operator = forward_operator
+        self.norm_func = norm_func
+        super().__init__(max_iter)
+
+    def _update(self) -> None:
+        """Perform a single update step of the algorithm.
+
+        Updates maximum eigenvalue guess and corresponding eigenvector.
+
+        Returns:
+            ``None``.
+        """
+        y = self.forward_operator(self.x)
+        if self.norm_func is None:
+            self.max_eig = (y * self.x.conj()).sum() / (self.x * self.x.conj()).sum()
+        else:
+            self.max_eig = self.norm_func(y)
+        self.x = y / self.max_eig
+
+    def _done(self) -> bool:
+        """Check if the algorithm is done.
+
+        Returns:
+            Whether the algorithm has converged or not.
+        """
+        return self.iter >= self.max_iter
+
+    def _fit(self, x: torch.Tensor) -> None:
+        """Sets initial maximum eigenvector guess.
+
+        Args:
+            x: Initial guess for the eigenvector.
+
+        Returns:
+            ``None``.
+        """
+        # pylint: disable=arguments-differ
+        self.x = x
