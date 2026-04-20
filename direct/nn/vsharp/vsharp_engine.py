@@ -1,0 +1,835 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Engines for vSHARP 2D and 3D models [1].
+
+Includes supervised, self-supervised and joint supervised and self-supervised learning [2] engines.
+
+References:
+    .. [#] Yiasemis, G., Moriakov, N., Sánchez, C.I., Sonke, J.-J., Teuwen, J.: JSSL: Joint Supervised and
+        Self-supervised Learning for MRI Reconstruction, http://arxiv.org/abs/2311.15856, (2023).
+        https://doi.org/10.48550/arXiv.2311.15856.
+    .. [#] Yiasemis, G., Moriakov, N., Sánchez, C.I., Sonke, J.-J., Teuwen, J.: JSSL: Joint Supervised and
+        Self-supervised Learning for MRI Reconstruction, http://arxiv.org/abs/2311.15856, (2023).
+        https://doi.org/10.48550/arXiv.2311.15856.
+"""
+
+from collections.abc import Callable
+from typing import Any
+
+import torch
+from torch import nn
+from torch.amp import autocast
+
+from direct.config import BaseConfig
+from direct.data import transforms as T
+from direct.engine import DoIterationOutput
+from direct.nn.adaptive.utils import export_sampling_mask
+from direct.nn.mri_models import MRIModelEngine
+from direct.nn.ssl.mri_models import JSSLMRIModelEngine, SSLMRIModelEngine
+from direct.types import FFTOperator, TensorOrNone
+from direct.utils import detach_dict, dict_to_device
+
+
+class VSharpNet3DEngine(MRIModelEngine):
+    """VSharpNet 3D Model Engine."""
+
+    def __init__(
+        self,
+        cfg: BaseConfig,
+        model: nn.Module,
+        device: str,
+        forward_operator: FFTOperator,
+        backward_operator: FFTOperator,
+        mixed_precision: bool = False,
+        **models: nn.Module,
+    ):
+        """Inits :class:`VSharpNet3DEngine`.
+
+        Args:
+            cfg: Configuration file.
+            model: Model.
+            device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+            forward_operator: The forward operator. Default is ``None``.
+            backward_operator: The backward operator. Default is ``None``.
+            mixed_precision: Use mixed precision. Default is ``False``.
+            **models: Additional models.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__(
+            cfg,
+            model,
+            device,
+            forward_operator=forward_operator,
+            backward_operator=backward_operator,
+            mixed_precision=mixed_precision,
+            **models,
+        )
+
+        self._spatial_dims = (3, 4)
+
+    def _do_iteration(
+        self,
+        data: dict[str, Any],
+        loss_fns: dict[str, Callable] | None = None,
+        regularizer_fns: dict[str, Callable] | None = None,
+    ) -> DoIterationOutput:
+        """Performs forward method and calculates loss functions.
+
+        Args:
+            data: Data containing keys with values tensors such as k-space, image, sensitivity map, etc.
+            loss_fns: callable loss functions.
+            regularizer_fns: callable regularization functions.
+
+        Returns:
+            Contains outputs.
+        """
+
+        # loss_fns can be None, e.g. during validation
+        if loss_fns is None:
+            loss_fns = {}
+
+        data = dict_to_device(data, self.device)
+
+        output_image: TensorOrNone
+        output_kspace: TensorOrNone
+
+        loss_dict_reconstruction = {
+            k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in loss_fns
+        }
+
+        if "registration_model" in self.models:
+            loss_dict_registration = {
+                k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in loss_fns
+            }
+        loss_registration = torch.tensor([0.0], dtype=data["target"].dtype).to(self.device)
+
+        with autocast("cuda", enabled=self.mixed_precision):
+            self._attach_auxiliary_data(data)
+
+            output_images, output_kspace = self.forward_function(data)
+            output_images = [T.modulus_if_complex(_, complex_axis=self._complex_dim) for _ in output_images]
+
+            auxiliary_loss_weights = torch.logspace(-1, 0, steps=len(output_images)).to(output_images[0])
+            # Compute reconstruction loss
+            for i, output_image in enumerate(output_images):
+                loss_dict_reconstruction = self.compute_loss_on_data(
+                    loss_dict_reconstruction,
+                    loss_fns,
+                    data,
+                    output_image=output_image,
+                    output_kspace=None,
+                    weight=auxiliary_loss_weights[i]
+                    * (
+                        1
+                        if "registration_model" not in self.models
+                        else self.cfg.additional_models.registration_model.rec_loss_factor  # ty: ignore[unresolved-attribute]
+                    ),
+                )
+
+            # Compute reconstruction loss on k-space
+            loss_dict_reconstruction = self.compute_loss_on_data(
+                loss_dict_reconstruction,
+                loss_fns,
+                data,
+                output_image=None,
+                output_kspace=output_kspace,
+            )
+
+            if "registration_model" in self.models:
+                registered_image, displacement_field = self.do_registration(
+                    data,
+                    (
+                        output_images[-1]
+                        if self.cfg.additional_models.registration_model.train_end_to_end  # ty: ignore[unresolved-attribute]
+                        else output_images[-1].detach()
+                    ),
+                )
+
+                # Registration loss
+                loss_dict_registration = self.add_registration_image_losses(
+                    loss_dict_registration,
+                    loss_fns,
+                    data,
+                    registered_image,
+                    displacement_field,
+                )
+
+                if "displacement_field" in data:
+                    target_displacement_field = data["displacement_field"]
+                else:
+                    target_displacement_field = None
+
+                # Displacement field loss
+                loss_dict_registration = self.compute_loss_on_data(
+                    loss_dict_registration,
+                    loss_fns,
+                    data,
+                    output_displacement_field=displacement_field,
+                    target_displacement_field=target_displacement_field,
+                    weight=self.cfg.additional_models.registration_model.reg_loss_factor,  # ty: ignore[unresolved-attribute]
+                )
+
+                loss_registration = sum(loss_dict_registration.values())  # type: ignore
+
+            loss_reconstruction = sum(loss_dict_reconstruction.values())  # type: ignore
+
+        if self.model.training:
+            # Backpropagate registration loss only if registration model (if present) is DL-based
+            if "registration_model" in self.models and len(list(self.models["registration_model"].parameters())) > 0:
+                # If decoupled training freeze corresponding parameters
+                if self.cfg.additional_models.registration_model.decoupled_training:  # ty: ignore[unresolved-attribute]
+                    for param in self.models["registration_model"].parameters():
+                        param.requires_grad = False  # Freeze registration model
+                    # Reconstruction loss backward
+                    self._scaler.scale(loss_reconstruction).backward()
+
+                    if len(list(self.models["registration_model"].parameters())) > 0:
+                        for param in self.models["registration_model"].parameters():
+                            param.requires_grad = True  # Unfreeze registration model
+
+                        # Freeze other models
+                        for param in self.model.parameters():
+                            param.requires_grad = False
+                        for model_name, model in self.models.items():
+                            if model_name != "registration_model":
+                                for param in model.parameters():
+                                    param.requires_grad = False
+                        # Registation loss backward
+                        self._scaler.scale(loss_registration).backward()
+
+                        # Unfreeze all models
+                        for param in self.model.parameters():
+                            param.requires_grad = True
+                        for model_name, model in self.models.items():
+                            if model_name != "registration_model":
+                                for param in model.parameters():
+                                    param.requires_grad = True
+                else:
+                    # End-to-end training
+                    self._scaler.scale(loss_reconstruction + loss_registration).backward()
+            else:
+                self._scaler.scale(loss_reconstruction).backward()
+
+        # Detach loss dictionaries for logging
+        loss_dict = {
+            **(
+                {f"registration_{k}": v for k, v in loss_dict_registration.items()}
+                if "registration_model" in self.models
+                else {}
+            ),
+            **dict(loss_dict_reconstruction.items()),
+        }
+        loss_dict = detach_dict(loss_dict)
+
+        output_image = output_images[-1]
+        return DoIterationOutput(
+            output_image=(
+                (output_image, registered_image, displacement_field)
+                if "registration_model" in self.models
+                else output_image
+            ),
+            sensitivity_map=data["sensitivity_map"],
+            sampling_mask=export_sampling_mask(data),
+            data_dict={**loss_dict},
+        )
+
+    def forward_function(self, data: dict[str, Any]) -> tuple[torch.Tensor, None]:
+        """Forward function.
+
+        Args:
+            data: Data.
+
+        Returns:
+            The result.
+        """
+        data["sensitivity_map"] = self.compute_sensitivity_map(data["sensitivity_map"])
+
+        data = self.perform_sampling(data)
+
+        output_images = self.model(
+            masked_kspace=data["masked_kspace"],
+            sampling_mask=data["sampling_mask"],
+            sensitivity_map=data["sensitivity_map"],
+            auxiliary_data=self.auxiliary_data_from(data),
+        )  # shape (batch, height,  width, complex[=2])
+
+        output_image = output_images[-1]
+        output_kspace = data["masked_kspace"] + T.apply_mask(
+            T.apply_padding(
+                self.forward_operator(
+                    T.expand_operator(output_image, data["sensitivity_map"], dim=self._coil_dim),
+                    dim=self._spatial_dims,
+                ),
+                padding=data.get("padding", None),
+            ),
+            1 - data["sampling_mask"].float(),
+            return_mask=False,
+        )
+
+        return output_images, output_kspace
+
+
+class VSharpNetEngine(MRIModelEngine):
+    """VSharpNet 2D Model Engine."""
+
+    def __init__(
+        self,
+        cfg: BaseConfig,
+        model: nn.Module,
+        device: str,
+        forward_operator: FFTOperator,
+        backward_operator: FFTOperator,
+        mixed_precision: bool = False,
+        **models: nn.Module,
+    ) -> None:
+        """Inits :class:`VSharpNetEngine`.
+
+        Args:
+            cfg: Configuration file.
+            model: Model.
+            device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+            forward_operator: The forward operator. Default is ``None``.
+            backward_operator: The backward operator. Default is ``None``.
+            mixed_precision: Use mixed precision. Default is ``False``.
+            **models: Additional models for secondary tasks, such as sensitivity map estimation model.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__(
+            cfg,
+            model,
+            device,
+            forward_operator=forward_operator,
+            backward_operator=backward_operator,
+            mixed_precision=mixed_precision,
+            **models,
+        )
+
+    def _do_iteration(
+        self,
+        data: dict[str, Any],
+        loss_fns: dict[str, Callable] | None = None,
+        regularizer_fns: dict[str, Callable] | None = None,
+    ) -> DoIterationOutput:
+        """Performs forward method and calculates loss functions.
+
+        Args:
+            data: Data containing keys with values tensors such as k-space, image, sensitivity map, etc.
+            loss_fns: callable loss functions.
+            regularizer_fns: callable regularization functions.
+
+        Returns:
+            Contains outputs.
+        """
+
+        # loss_fns can be None, e.g. during validation
+        if loss_fns is None:
+            loss_fns = {}
+
+        data = dict_to_device(data, self.device)
+
+        output_image: TensorOrNone
+        output_kspace: TensorOrNone
+
+        with autocast("cuda", enabled=self.mixed_precision):
+            self._attach_auxiliary_data(data)
+
+            output_images, output_kspace = self.forward_function(data)
+            output_images = [T.modulus_if_complex(_, complex_axis=self._complex_dim) for _ in output_images]
+            loss_dict = {k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in loss_fns}
+
+            auxiliary_loss_weights = torch.logspace(-1, 0, steps=len(output_images)).to(output_images[0])
+            for i, output_image in enumerate(output_images):
+                loss_dict = self.compute_loss_on_data(
+                    loss_dict,
+                    loss_fns,
+                    data,
+                    output_image=output_image,
+                    weight=auxiliary_loss_weights[i],
+                )
+            # Compute loss on k-space
+            loss_dict = self.compute_loss_on_data(loss_dict, loss_fns, data, output_kspace=output_kspace)
+
+            loss = sum(loss_dict.values())  # type: ignore
+
+        if self.model.training:
+            self._scaler.scale(loss).backward()
+
+        loss_dict = detach_dict(loss_dict)  # Detach dict, only used for logging.
+
+        output_image = output_images[-1]
+        return DoIterationOutput(
+            output_image=output_image,
+            sensitivity_map=data["sensitivity_map"],
+            sampling_mask=export_sampling_mask(data),
+            data_dict={**loss_dict},
+        )
+
+    def forward_function(self, data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward function.
+
+        Args:
+            data: Data.
+
+        Returns:
+            The result.
+        """
+        data["sensitivity_map"] = self.compute_sensitivity_map(data["sensitivity_map"])
+
+        data = self.perform_sampling(data)
+
+        output_images = self.model(
+            masked_kspace=data["masked_kspace"],
+            sampling_mask=data["sampling_mask"],
+            sensitivity_map=data["sensitivity_map"],
+            auxiliary_data=self.auxiliary_data_from(data),
+        )  # shape (batch, height,  width, complex[=2])
+
+        output_image = output_images[-1]
+        output_kspace = data["masked_kspace"] + T.apply_mask(
+            T.apply_padding(
+                self.forward_operator(
+                    T.expand_operator(output_image, data["sensitivity_map"], dim=self._coil_dim),
+                    dim=self._spatial_dims,
+                ),
+                padding=data.get("padding", None),
+            ),
+            1 - data["sampling_mask"].float(),
+            return_mask=False,
+        )
+
+        return output_images, output_kspace
+
+
+class VSharpNetSSLEngine(SSLMRIModelEngine):
+    """Self-supervised Learning vSHARP Model 2D Engine.
+
+    Used for the main experiments for SSL in the JSSL paper [1].
+
+    Args:
+        cfg: Configuration file.
+        model: Model.
+        device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+        forward_operator: The forward operator. Default is ``None``.
+        backward_operator: The backward operator. Default is ``None``.
+        mixed_precision: Use mixed precision. Default is ``False``.
+        **models: Additional models.
+
+    References:
+        .. [#] Yiasemis, G., Moriakov, N., Sánchez, C.I., Sonke, J.-J., Teuwen, J.: JSSL: Joint Supervised and
+            Self-supervised Learning for MRI Reconstruction, http://arxiv.org/abs/2311.15856, (2023).
+            https://doi.org/10.48550/arXiv.2311.15856.
+    """
+
+    def __init__(
+        self,
+        cfg: BaseConfig,
+        model: nn.Module,
+        device: str,
+        forward_operator: FFTOperator,
+        backward_operator: FFTOperator,
+        mixed_precision: bool = False,
+        **models: nn.Module,
+    ):
+        """Inits :class:`VSharpNetSSLEngine`.
+
+        Args:
+            cfg: Configuration file.
+            model: Model.
+            device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+            forward_operator: The forward operator. Default is ``None``.
+            backward_operator: The backward operator. Default is ``None``.
+            mixed_precision: Use mixed precision. Default is ``False``.
+            **models: Additional models.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__(
+            cfg,
+            model,
+            device,
+            forward_operator=forward_operator,
+            backward_operator=backward_operator,
+            mixed_precision=mixed_precision,
+            **models,
+        )
+
+    def forward_function(self, data: dict[str, Any]) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Forward function for :class:`VSharpNetSSLEngine`.
+
+        Args:
+            data: Data.
+
+        Returns:
+            The result.
+        """
+        raise NotImplementedError(
+            "Forward function for SSL vSHARP engine is not implemented. `VSharpNetSSLEngine` "
+            "implements the `_do_iteration` method itself so the forward function should not be "
+            "called."
+        )
+
+    def _do_iteration(
+        self,
+        data: dict[str, Any],
+        loss_fns: dict[str, Callable] | None = None,
+        regularizer_fns: dict[str, Callable] | None = None,
+    ) -> DoIterationOutput:
+        """This function implements the `_do_iteration` for the SSL vSHARP model.
+
+        Returns:
+            Output of the iteration.
+            keys ``"masked_kspace"`` and ``"sampling_mask"``.
+
+        Args:
+            data: Input data dictionary. The dictionary should contain the following keys: - ``"input_kspace"`` if
+                training, otherwise ``"masked_kspace"``. - ``"input_sampling_mask"`` if training, otherwise
+                ``"sampling_mask"``. - ``"target_sampling_mask"``: Sampling mask for the target k-space if training. -
+                ``"sensitivity_map"``: Sensitivity map. - ``"target"``: Target image. - ``"padding"``: Padding,
+                optionally.
+            loss_fns: Loss functions, optional.
+            regularizer_fns: Regularizer functions, optional.
+        """
+
+        # loss_fns can be None, e.g. during validation
+        if loss_fns is None:
+            loss_fns = {}
+
+        if regularizer_fns is None:
+            regularizer_fns = {}
+
+        # Move data to device
+        data = dict_to_device(data, self.device)
+        self._attach_auxiliary_data(data)
+
+        # Get the k-space and mask which differ during training and inference for SSL
+        if self.model.training:
+            kspace, mask = data["input_kspace"], data["input_sampling_mask"]
+        else:
+            kspace, mask = data["masked_kspace"], data["sampling_mask"]
+
+        # Initialize loss and regularizer dictionaries
+        loss_dict = {k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in loss_fns}
+        regularizer_dict = {k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in regularizer_fns}
+
+        with autocast("cuda", enabled=self.mixed_precision):
+            data["sensitivity_map"] = self.compute_sensitivity_map(data["sensitivity_map"])
+
+            output_images = self.model(
+                masked_kspace=kspace,
+                sampling_mask=mask,
+                sensitivity_map=data["sensitivity_map"],
+                auxiliary_data=self.auxiliary_data_from(data),
+            )
+
+            if self.model.training:
+                if len(output_images) > 1:
+                    # Initialize auxiliary loss weights with a logarithmic scale if multiple auxiliary steps
+                    auxiliary_loss_weights = torch.logspace(-1, 0, steps=len(output_images)).to(output_images[0])
+                else:
+                    # Initialize auxiliary loss weights with a single value of 1.0 if single step
+                    auxiliary_loss_weights = torch.ones(1).to(output_images[0])
+
+                for i, output_image in enumerate(output_images):
+                    # Data consistency
+                    output_kspace = T.apply_padding(
+                        kspace + self._forward_operator(output_image, data["sensitivity_map"], ~mask),
+                        padding=data.get("padding", None),
+                    )
+                    # Project predicted k-space onto target k-space if SSL
+                    output_kspace = T.apply_mask(output_kspace, data["target_sampling_mask"], return_mask=False)
+
+                    # Compute k-space loss per auxiliary step
+                    loss_dict = self.compute_loss_on_data(
+                        loss_dict,
+                        loss_fns,
+                        data,
+                        output_kspace=output_kspace,
+                        weight=auxiliary_loss_weights[i],
+                    )
+                    regularizer_dict = self.compute_loss_on_data(
+                        regularizer_dict,
+                        regularizer_fns,
+                        data,
+                        output_kspace=output_kspace,
+                        weight=auxiliary_loss_weights[i],
+                    )
+
+                    # SENSE reconstruction
+                    output_images[i] = T.modulus(
+                        T.reduce_operator(
+                            self.backward_operator(output_kspace, dim=self._spatial_dims),
+                            data["sensitivity_map"],
+                            self._coil_dim,
+                        )
+                    )
+
+                    # Compute image loss per auxiliary step
+                    loss_dict = self.compute_loss_on_data(
+                        loss_dict,
+                        loss_fns,
+                        data,
+                        output_image=output_images[i],
+                        weight=auxiliary_loss_weights[i],
+                    )
+                    regularizer_dict = self.compute_loss_on_data(
+                        regularizer_dict,
+                        regularizer_fns,
+                        data,
+                        output_image=output_images[i],
+                        weight=auxiliary_loss_weights[i],
+                    )
+
+                loss = sum(loss_dict.values()) + sum(regularizer_dict.values())  # type: ignore
+                self._scaler.scale(loss).backward()
+
+                output_image = output_images[-1]
+            else:
+                output_kspace = T.apply_padding(
+                    kspace + self._forward_operator(output_images[-1], data["sensitivity_map"], ~mask),
+                    padding=data.get("padding", None),
+                )
+                # SENSE reconstruction using data consistent k-space
+                output_image = T.modulus(
+                    T.reduce_operator(
+                        self.backward_operator(output_kspace, dim=self._spatial_dims),
+                        data["sensitivity_map"],
+                        self._coil_dim,
+                    )
+                )
+
+        loss_dict = detach_dict(loss_dict)  # Detach dict, only used for logging.
+        regularizer_dict = detach_dict(regularizer_dict)
+
+        return DoIterationOutput(
+            output_image=output_image,
+            sensitivity_map=data["sensitivity_map"],
+            sampling_mask=mask,
+            data_dict={**loss_dict, **regularizer_dict},
+        )
+
+
+class VSharpNetJSSLEngine(JSSLMRIModelEngine):
+    """Joint Supervised and Self-supervised Learning vSHARP Model 2D Engine.
+
+    Used for the main experiments in the JSSL paper [1].
+
+    Args:
+        cfg: Configuration file.
+        model: Model.
+        device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+        forward_operator: The forward operator. Default is ``None``.
+        backward_operator: The backward operator. Default is ``None``.
+        mixed_precision: Use mixed precision. Default is ``False``.
+        **models: Additional models.
+
+    References:
+        .. [#] Yiasemis, G., Moriakov, N., Sánchez, C.I., Sonke, J.-J., Teuwen, J.: JSSL: Joint Supervised and
+            Self-supervised Learning for MRI Reconstruction, http://arxiv.org/abs/2311.15856, (2023).
+            https://doi.org/10.48550/arXiv.2311.15856.
+    """
+
+    def __init__(
+        self,
+        cfg: BaseConfig,
+        model: nn.Module,
+        device: str,
+        forward_operator: FFTOperator,
+        backward_operator: FFTOperator,
+        mixed_precision: bool = False,
+        **models: nn.Module,
+    ):
+        """Inits :class:`VSharpNetJSSLEngine`.
+
+        Args:
+            cfg: Configuration file.
+            model: Model.
+            device: Device. Can be "cuda:{idx}" or ``"cpu"``.
+            forward_operator: The forward operator. Default is ``None``.
+            backward_operator: The backward operator. Default is ``None``.
+            mixed_precision: Use mixed precision. Default is ``False``.
+            **models: Additional models.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__(
+            cfg,
+            model,
+            device,
+            forward_operator=forward_operator,
+            backward_operator=backward_operator,
+            mixed_precision=mixed_precision,
+            **models,
+        )
+
+    def forward_function(self, data: dict[str, Any]) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Forward function for :class:`VSharpNetJSSLEngine`.
+
+        Args:
+            data: Data.
+
+        Returns:
+            The result.
+        """
+        raise NotImplementedError(
+            "Forward function for JSSL vSHARP is not implemented. `VSharpNetJSSLEngine` "
+            "implements the `_do_iteration` method itself so the forward function should not be "
+            "called."
+        )
+
+    def _do_iteration(
+        self,
+        data: dict[str, Any],
+        loss_fns: dict[str, Callable] | None = None,
+        regularizer_fns: dict[str, Callable] | None = None,
+    ) -> DoIterationOutput:
+        """This function implements the `_do_iteration` for the JSSL vSHARP model.
+
+        Returns:
+            Output of the iteration.
+            keys ``"masked_kspace"`` and ``"sampling_mask"``.
+
+        Args:
+            data: Input data dictionary. The dictionary should contain the following keys: - ``"is_ssl"``: Boolean
+                indicating if the sample is for SSL training. - ``"input_kspace"`` if SSL training, otherwise
+                ``"masked_kspace"``. - ``"input_sampling_mask"`` if SSL training, otherwise ``"sampling_mask"``. -
+                ``"target_sampling_mask"``: Sampling mask for the target k-space if SSL training. -
+                ``"sensitivity_map"``: Sensitivity map. - ``"target"``: Target image. - ``"padding"``: Padding,
+                optionally.
+            loss_fns: Loss functions, optional.
+            regularizer_fns: Regularizer functions, optional.
+        """
+
+        # loss_fns can be None, e.g. during validation
+        if loss_fns is None:
+            loss_fns = {}
+
+        if regularizer_fns is None:
+            regularizer_fns = {}
+
+        # Move data to device
+        data = dict_to_device(data, self.device)
+        self._attach_auxiliary_data(data)
+
+        # Get a boolean indicating if the sample is for SSL training
+        # This will expect the input data to contain the keys "input_kspace" and "input_sampling_mask" if SSL training
+        is_ssl = data["is_ssl"][0]
+
+        # Get the k-space and mask which differ if SSL training or supervised training
+        # The also differ during training and inference for SSL
+        if is_ssl and self.model.training:
+            kspace, mask = data["input_kspace"], data["input_sampling_mask"]
+        else:
+            kspace, mask = data["masked_kspace"], data["sampling_mask"]
+
+        # Initialize loss and regularizer dictionaries
+        loss_dict = {k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in loss_fns}
+        regularizer_dict = {k: torch.tensor([0.0], dtype=data["target"].dtype).to(self.device) for k in regularizer_fns}
+
+        with autocast("cuda", enabled=self.mixed_precision):
+            data["sensitivity_map"] = self.compute_sensitivity_map(data["sensitivity_map"])
+
+            output_images = self.model(
+                masked_kspace=kspace,
+                sampling_mask=mask,
+                sensitivity_map=data["sensitivity_map"],
+                auxiliary_data=self.auxiliary_data_from(data),
+            )
+
+            if self.model.training:
+                if len(output_images) > 1:
+                    # Initialize auxiliary loss weights with a logarithmic scale if multiple auxiliary steps
+                    auxiliary_loss_weights = torch.logspace(-1, 0, steps=len(output_images)).to(output_images[0])
+                else:
+                    # Initialize auxiliary loss weights with a single value of 1.0 if single step
+                    auxiliary_loss_weights = torch.ones(1).to(output_images[0])
+
+                for i, output_image in enumerate(output_images):
+                    # Data consistency
+                    output_kspace = T.apply_padding(
+                        kspace + self._forward_operator(output_image, data["sensitivity_map"], ~mask),
+                        padding=data.get("padding", None),
+                    )
+                    if is_ssl:
+                        # Project predicted k-space onto target k-space if SSL
+                        output_kspace = T.apply_mask(
+                            output_kspace,
+                            data["target_sampling_mask"],
+                            return_mask=False,
+                        )
+
+                    # Compute k-space loss per auxiliary step
+                    loss_dict = self.compute_loss_on_data(
+                        loss_dict,
+                        loss_fns,
+                        data,
+                        output_kspace=output_kspace,
+                        weight=auxiliary_loss_weights[i],
+                    )
+                    regularizer_dict = self.compute_loss_on_data(
+                        regularizer_dict,
+                        regularizer_fns,
+                        data,
+                        output_kspace=output_kspace,
+                        weight=auxiliary_loss_weights[i],
+                    )
+
+                    # SENSE reconstruction if SSL else modulus if supervised
+                    output_images[i] = T.modulus(
+                        T.reduce_operator(
+                            self.backward_operator(output_kspace, dim=self._spatial_dims),
+                            data["sensitivity_map"],
+                            self._coil_dim,
+                        )
+                        if is_ssl
+                        else output_images[i]
+                    )
+
+                    # Compute image loss per auxiliary step
+                    loss_dict = self.compute_loss_on_data(
+                        loss_dict,
+                        loss_fns,
+                        data,
+                        output_image=output_images[i],
+                        weight=auxiliary_loss_weights[i],
+                    )
+                    regularizer_dict = self.compute_loss_on_data(
+                        regularizer_dict,
+                        regularizer_fns,
+                        data,
+                        output_image=output_images[i],
+                        weight=auxiliary_loss_weights[i],
+                    )
+
+                loss = sum(loss_dict.values()) + sum(regularizer_dict.values())  # type: ignore
+                self._scaler.scale(loss).backward()
+
+                output_image = output_images[-1]
+            else:
+                output_image = T.modulus(output_images[-1])
+
+        loss_dict = detach_dict(loss_dict)  # Detach dict, only used for logging.
+        regularizer_dict = detach_dict(regularizer_dict)
+
+        return DoIterationOutput(
+            output_image=output_image,
+            sensitivity_map=data["sensitivity_map"],
+            sampling_mask=mask,
+            data_dict={**loss_dict, **regularizer_dict},
+        )
