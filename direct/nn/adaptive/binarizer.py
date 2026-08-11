@@ -1,0 +1,151 @@
+# Copyright 2026 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Straight-through binarizers for adaptive k-space sampling."""
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.autograd import Function
+
+from direct.exceptions import RejectionSamplingError
+
+__all__ = ["RejectionSamplingError", "ThresholdSigmoidMask", "deterministic_binarizer"]
+
+
+class ThresholdSigmoidMaskFunction(Function):
+    """Straight-through estimator for stochastic mask binarization.
+
+    The forward step stochastically binarizes the probability mask via rejection
+    sampling. The backward step approximates the non-differentiable threshold
+    operator with a sigmoid of large slope.
+    """
+
+    @staticmethod
+    def forward(ctx, inputs, slope, clamp):
+        """Forward.
+
+        Args:
+            ctx: Ctx.
+            inputs: Inputs.
+            slope: Slope.
+            clamp: Clamp.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            RejectionSamplingError: If the operation cannot be completed.
+        """
+        batch_size = len(inputs)
+        probs = []
+        results = []
+
+        for i in range(batch_size):
+            x = inputs[i : i + 1]
+            count = 0
+            while True:
+                prob = x.new(x.size()).uniform_()
+                result = (x > prob).float()
+                if torch.isclose(torch.mean(result), torch.mean(x), atol=1e-3):
+                    break
+                count += 1
+                if count > 1000:
+                    raise RejectionSamplingError(
+                        "Rejection sampling exceeded number of tries. Probably this means all "
+                        "sampling probabilities are 1 or 0 for some reason, leading to divide "
+                        "by zero in rescale_probs()."
+                    )
+            probs.append(prob)
+            results.append(result)
+        results = torch.cat(results, dim=0)
+        probs = torch.cat(probs, dim=0)
+
+        slope = torch.tensor(slope, requires_grad=False)
+        ctx.clamp = clamp
+        ctx.save_for_backward(inputs, probs, slope)
+        return results
+
+    @staticmethod
+    def backward(ctx, grad_output):  # ty: ignore[invalid-method-override]
+        """Backward.
+
+        Args:
+            ctx: Ctx.
+            grad_output: Grad output.
+
+        Returns:
+            ``None``.
+        """
+        inputs, prob, slope = ctx.saved_tensors
+        if ctx.clamp:
+            grad_output = F.hardtanh(grad_output)
+        # derivative of sigmoid function
+        current_grad = (
+            slope * torch.exp(-slope * (inputs - prob)) / torch.pow((torch.exp(-slope * (inputs - prob)) + 1), 2)
+        )
+        return current_grad * grad_output, None, None
+
+
+class ThresholdSigmoidMask(nn.Module):
+    """Module wrapper around :class:`ThresholdSigmoidMaskFunction`."""
+
+    def __init__(self, slope: float, clamp: bool) -> None:
+        """Inits :class:`ThresholdSigmoidMask`.
+
+        Args:
+            slope: Slope of the sigmoid used in the straight-through backward pass.
+            clamp: If ``True``, clamp gradients with :func:`torch.nn.functional.hardtanh`.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__()
+        self._slope = slope
+        self._clamp = clamp
+
+        self._fun = ThresholdSigmoidMaskFunction.apply
+
+    def forward(self, input_probs: torch.Tensor) -> torch.Tensor:
+        """Stochastically binarize probability maps.
+
+        Args:
+            input_probs: Probability map of shape ``(batch, num_actions)``.
+
+        Returns:
+            Binary mask with the same shape as ``input_probs``.
+        """
+        return self._fun(input_probs, self._slope, self._clamp)
+
+
+def deterministic_binarizer(input_probs: torch.Tensor, budget: int) -> torch.Tensor:
+    """Binarizes a tensor based on the highest probabilities within the budget.
+
+    Args:
+        input_probs: Input probabilities of shape ``(batch, max_lines)``.
+        budget: The number of lines to keep active (binarized).
+
+    Returns:
+        Binarized tensor with shape ``(batch, max_lines)``.
+    """
+    # Get the top-k values and indices along the last dimension
+    _, top_indices = torch.topk(input_probs, k=budget, dim=-1)
+
+    # Create a binary mask with the same shape as the input tensor
+    binarized_tensor = torch.zeros_like(input_probs)
+
+    # Set the indices corresponding to the top-k values to 1 in the binary mask
+    binarized_tensor.scatter_(dim=-1, index=top_indices, value=1)
+
+    return binarized_tensor
