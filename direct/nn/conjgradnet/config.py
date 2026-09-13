@@ -1,0 +1,48 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""direct.nn.conjgradnet.config module."""
+
+from dataclasses import dataclass
+
+from direct.config.defaults import ModelConfig
+from direct.nn.conjgradnet.conjgrad import CGUpdateType
+from direct.nn.types import ActivationType, InitType, ModelName
+
+
+@dataclass
+class ConjGradNetConfig(ModelConfig):
+    """ConjGradNetConfig."""
+
+    num_steps: int = 8
+    image_init: InitType = InitType.ZEROS
+    no_parameter_sharing: bool = True
+    cg_tol: float = 1e-7
+    cg_iters: int = 10
+    cg_param_update_type: CGUpdateType = CGUpdateType.FR
+    denoiser_architecture: ModelName = ModelName.RESNET
+    resnet_hidden_channels: int = 128
+    resnet_num_blocks: int = 15
+    resenet_batchnorm: bool = True
+    resenet_scale: float | None = 0.1
+    unet_num_filters: int | None = 32
+    unet_num_pool_layers: int | None = 4
+    unet_dropout: float | None = 0.0
+    unet_conv_out_bias: bool = False
+    didn_hidden_channels: int | None = 16
+    didn_num_dubs: int | None = 6
+    didn_num_convs_recon: int | None = 9
+    conv_hidden_channels: int | None = 64
+    conv_n_convs: int | None = 15
+    conv_activation: ActivationType = ActivationType.RELU
+    conv_batchnorm: bool | None = False
