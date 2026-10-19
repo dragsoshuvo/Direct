@@ -1,0 +1,91 @@
+# Copyright 2025 AI for Oncology Research Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""direct.nn.crossdomain.multicoil module."""
+
+import torch
+from torch import nn
+
+
+class MultiCoil(nn.Module):
+    """This makes the forward pass of multi-coil data of shape ``(N, N_coils, H, W, C)`` to a model.
+
+    If coil_to_batch is set to ``True``, coil dimension is moved to the batch dimension. Otherwise, it passes to the
+    model
+    each coil-data individually.
+    """
+
+    def __init__(self, model: nn.Module, coil_dim: int = 1, coil_to_batch: bool = False):
+        """Inits :class:`MultiCoil`.
+
+        Args:
+            model: Any nn.Module that takes as input with 4D data ``(N, H, W, C)``. Typically a convolutional-like
+                model.
+            coil_dim: Coil dimension. Default is ``1``.
+            coil_to_batch: If ``True`` batch and coil dimensions are merged when forwarded by the model and unmerged
+                when outputted. Otherwise, input is forwarded to the model per coil.
+
+        Returns:
+            ``None``.
+        """
+        super().__init__()
+
+        self.model = model
+        self.coil_to_batch = coil_to_batch
+        self._coil_dim = coil_dim
+
+    def _compute_model_per_coil(self, data: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
+        """Compute model per coil.
+
+        Args:
+            data: Data.
+            y: Y.
+
+        Returns:
+            The result.
+        """
+        output = []
+
+        for idx in range(data.size(self._coil_dim)):
+            subselected_data = data.select(self._coil_dim, idx)
+            if y is not None:
+                output.append(self.model(subselected_data, y))
+            else:
+                output.append(self.model(subselected_data))
+
+        return torch.stack(output, dim=self._coil_dim)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
+        """Performs the forward pass of MultiCoil.
+
+        Args:
+            x: Multi-coil input of shape ``(N, coil, height, width, in_channels)``.
+
+        Returns:
+            Multi-coil output of shape ``(N, coil, height, width, out_channels)``.
+        """
+        if self.coil_to_batch:
+            x = x.clone()
+            batch, coil, height, width, channels = x.size()
+
+            x = x.reshape(batch * coil, height, width, channels).permute(0, 3, 1, 2).contiguous()
+            if y is not None:
+                x = self.model(x, y).permute(0, 2, 3, 1)
+            else:
+                x = self.model(x).permute(0, 2, 3, 1)
+            x = x.reshape(batch, coil, height, width, -1)
+        else:
+            x = self._compute_model_per_coil(x, y).contiguous()
+
+        return x
