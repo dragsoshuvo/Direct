@@ -369,7 +369,7 @@ jobs:
           echo "Wheels:"; ls -l artifacts/wheels
           echo "Sdist:"; ls -l artifacts/sdist
       - name: Generate build provenance attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             artifacts/wheels/*.whl
