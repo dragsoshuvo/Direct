@@ -176,7 +176,7 @@ jobs:
           # on both 3.12 and 3.13 instead.
       - name: Upload wheel
         if: steps.gate.outputs.run == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # Two rows share a `platform` (abi3 + cp311), so disambiguate by abi;
           # every consumer globs `wheels-*` with merge-multiple, so downloads are
@@ -203,7 +203,7 @@ jobs:
           uv pip install "meson-python>=0.18" "meson>=1.5" "ninja>=1.11"
           uv build --sdist --no-build-isolation --out-dir artifacts/sdist
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: artifacts/sdist/*.tar.gz
